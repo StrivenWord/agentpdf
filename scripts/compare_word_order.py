@@ -18,6 +18,7 @@ def strip_yaml(text: str) -> str:
 
 def normalize_handmade_artifacts(text: str) -> str:
     # Known handmade typos / wrap artifacts that are not PDF truth.
+    reps = {
         "beable": "be able",
         "tobeable": "to be able",
         "ofits": "of its",
