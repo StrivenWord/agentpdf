@@ -1,0 +1,28 @@
+# Build
+build/
+cmake-build-*/
+out/
+*.o
+*.a
+*.dylib
+*.so
+*.exe
+
+# Binary
+/agentpdf
+/bin/
+
+# Run reports (processing stats; not versioned)
+run-reports/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Test outputs
+/test-out/
+/tmp-out/
+*.log
