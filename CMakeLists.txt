@@ -1,0 +1,80 @@
+cmake_minimum_required(VERSION 3.20)
+project(agentpdf VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+pkg_check_modules(LEPT REQUIRED IMPORTED_TARGET lept)
+pkg_check_modules(TESSERACT REQUIRED IMPORTED_TARGET tesseract)
+
+set(AGENTPDF_SOURCES
+  src/main.cpp
+  src/cli/args.cpp
+  src/interactive/repl.cpp
+  src/config/load.cpp
+  src/index/job_index.cpp
+  src/pdf/document.cpp
+  src/layout/leptonica_analyze.cpp
+  src/ocr/tesseract_page.cpp
+  src/text/paragraphs.cpp
+  src/text/footnotes.cpp
+  src/text/structure.cpp
+  src/meta/extract.cpp
+  src/markdown/assemble.cpp
+  src/pipeline/convert.cpp
+  src/report/run_stats.cpp
+  src/util/json_mini.cpp
+  src/util/fs_util.cpp
+  src/util/string_util.cpp
+)
+
+add_executable(agentpdf ${AGENTPDF_SOURCES})
+
+target_include_directories(agentpdf PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(agentpdf PRIVATE
+  PkgConfig::POPPLER_CPP
+  PkgConfig::LEPT
+  PkgConfig::TESSERACT
+)
+
+# Ship default configs next to the build tree for local runs.
+add_custom_command(TARGET agentpdf POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:agentpdf>/config
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          ${CMAKE_SOURCE_DIR}/config
+          $<TARGET_FILE_DIR:agentpdf>/config
+)
+
+enable_testing()
+add_test(NAME word_order_crane
+  COMMAND ${CMAKE_COMMAND}
+    -DAGENTPDF=$<TARGET_FILE:agentpdf>
+    -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/acm_crane2001.pdf
+    -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/acm_crane2001_handmade.md
+    -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
+    -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
+)
+add_test(NAME word_order_bernstein
+  COMMAND ${CMAKE_COMMAND}
+    -DAGENTPDF=$<TARGET_FILE:agentpdf>
+    -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/acm_bernstein2002.pdf
+    -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/acm_bernstein2002_handmade.md
+    -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
+    -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
+)
+add_test(NAME word_order_candidate
+  COMMAND ${CMAKE_COMMAND}
+    -DAGENTPDF=$<TARGET_FILE:agentpdf>
+    -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/candidate_paper.pdf
+    -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/candidate_paper_handmade.md
+    -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
+    -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
+)

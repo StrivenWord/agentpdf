@@ -1,0 +1,22 @@
+{
+  "required_fields": [
+    "title",
+    "authors",
+    "doi",
+    "date-published",
+    "source-format"
+  ],
+  "optional_fields": [
+    "publisher",
+    "keywords",
+    "abstract",
+    "date-received",
+    "date-accepted",
+    "pages",
+    "type",
+    "object-url",
+    "published-formats",
+    "date-extracted",
+    "date-accessed"
+  ]
+}

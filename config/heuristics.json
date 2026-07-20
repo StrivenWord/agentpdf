@@ -1,0 +1,20 @@
+{
+  "header_band_frac": 0.06,
+  "footer_band_frac": 0.06,
+  "column_gap_min_pts": 12.0,
+  "skew_tolerance_deg": 2.0,
+  "min_text_layer_chars_per_page": 40.0,
+  "paragraph_gap_pts": 8.0,
+  "line_merge_y_tol_pts": 2.5,
+  "rejoin_hyphenation": true,
+  "strip_running_headers": true,
+  "strip_page_numbers": true,
+  "dedupe_title_from_body": true,
+  "abstract_as_h1": true,
+  "keywords_as_h2": true,
+  "nest_numeric_headings": true,
+  "footnotes_to_endnotes": true,
+  "ocr_dpi": 300,
+  "ocr_workers": 2,
+  "tesseract_lang": "eng"
+}
