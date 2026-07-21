@@ -6,6 +6,10 @@
   "min_text_layer_chars_per_page": 40.0,
   "paragraph_gap_pts": 8.0,
   "line_merge_y_tol_pts": 2.5,
+  "margin_overlay_max_x_frac": 0.045,
+  "sidebar_max_width_frac": 0.30,
+  "footnote_zone_start_frac": 0.82,
+  "min_text_quality": 0.72,
   "rejoin_hyphenation": true,
   "strip_running_headers": true,
   "strip_page_numbers": true,
@@ -14,6 +18,7 @@
   "keywords_as_h2": true,
   "nest_numeric_headings": true,
   "footnotes_to_endnotes": true,
+  "ocr_when_scan_present": true,
   "ocr_dpi": 300,
   "ocr_workers": 2,
   "tesseract_lang": "eng"

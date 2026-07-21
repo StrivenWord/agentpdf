@@ -19,6 +19,15 @@ struct ExtractResult {
 
 ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heuristics);
 
+LayoutFamily detect_layout_family(const std::string& path, const std::string& title);
+double score_text_quality(const std::vector<NormalizedTextBox>& boxes);
+void classify_page_regions(PageDom& page, const Heuristics& heuristics);
+std::vector<TextLine> linearize_page(const PageDom& page, const Heuristics& heuristics);
+std::vector<TextLine> quarantine_stream_lines(
+    const PageDom& page, std::vector<TextLine> lines,
+    const Heuristics& heuristics);
+void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics);
+
 bool rasterize_page_raw(const std::string& path, int page_index, int dpi,
                         std::vector<unsigned char>& raw_argb, int& width, int& height,
                         int& bytes_per_row, std::string& err);

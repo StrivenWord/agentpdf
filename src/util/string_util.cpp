@@ -80,6 +80,14 @@ std::string normalize_typography(const std::string& s) {
     out.push_back(static_cast<char>(c));
     ++i;
   }
+  for (size_t pos = 0; (pos = out.find("''", pos)) != std::string::npos;) {
+    out.replace(pos, 2, "\"");
+    ++pos;
+  }
+  for (size_t pos = 0; (pos = out.find("``", pos)) != std::string::npos;) {
+    out.replace(pos, 2, "\"");
+    ++pos;
+  }
   return out;
 }
 

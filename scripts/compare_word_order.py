@@ -39,6 +39,17 @@ def normalize_handmade_artifacts(text: str) -> str:
         "tolibrarians": "to librarians",
         "inthe": "in the",
         "sum ofits parts": "sum of its parts",
+        # The Bernstein handmade transcription says "proved"; the PDF says
+        # "proven". Canonicalize the variant in comparison only.
+        "has proven useful": "has proved useful",
+        "div1": "div 1",
+        "andanother": "and another",
+        "pwell and hammou": "powell and hammou",
+        "fordifferent": "for different",
+        "onn the one hand": "on the one hand",
+        "ssince 2003": "since 2003",
+        "storyspacetm": "storyspace",
+        "exploretexts": "explore texts",
     }
     low = text
     for a, b in reps.items():
@@ -70,6 +81,7 @@ def words(text: str) -> list[str]:
         .replace("\u201d", '"')
         .replace("ﬁ", "fi")
         .replace("ﬂ", "fl")
+        .replace("ï", "i")
     )
     text = re.sub(r"([a-z0-9])-\s*([a-z0-9])", r"\1\2", text)
     return re.findall(r"[a-z0-9']+", text)

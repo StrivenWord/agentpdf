@@ -26,3 +26,6 @@ run-reports/
 /test-out/
 /tmp-out/
 *.log
+scripts/__pycache__/
+__pycache__/
+*.pyc

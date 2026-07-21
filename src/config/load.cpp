@@ -70,6 +70,13 @@ bool load_heuristics(const std::string& path, Heuristics& out, std::string& err)
       as_double(scalars, "min_text_layer_chars_per_page", out.min_text_layer_chars_per_page);
   out.paragraph_gap_pts = as_double(scalars, "paragraph_gap_pts", out.paragraph_gap_pts);
   out.line_merge_y_tol_pts = as_double(scalars, "line_merge_y_tol_pts", out.line_merge_y_tol_pts);
+  out.margin_overlay_max_x_frac =
+      as_double(scalars, "margin_overlay_max_x_frac", out.margin_overlay_max_x_frac);
+  out.sidebar_max_width_frac =
+      as_double(scalars, "sidebar_max_width_frac", out.sidebar_max_width_frac);
+  out.footnote_zone_start_frac =
+      as_double(scalars, "footnote_zone_start_frac", out.footnote_zone_start_frac);
+  out.min_text_quality = as_double(scalars, "min_text_quality", out.min_text_quality);
   out.rejoin_hyphenation = as_bool(scalars, "rejoin_hyphenation", out.rejoin_hyphenation);
   out.strip_running_headers = as_bool(scalars, "strip_running_headers", out.strip_running_headers);
   out.strip_page_numbers = as_bool(scalars, "strip_page_numbers", out.strip_page_numbers);
@@ -78,6 +85,8 @@ bool load_heuristics(const std::string& path, Heuristics& out, std::string& err)
   out.keywords_as_h2 = as_bool(scalars, "keywords_as_h2", out.keywords_as_h2);
   out.nest_numeric_headings = as_bool(scalars, "nest_numeric_headings", out.nest_numeric_headings);
   out.footnotes_to_endnotes = as_bool(scalars, "footnotes_to_endnotes", out.footnotes_to_endnotes);
+  out.ocr_when_scan_present =
+      as_bool(scalars, "ocr_when_scan_present", out.ocr_when_scan_present);
   out.ocr_dpi = as_int(scalars, "ocr_dpi", out.ocr_dpi);
   out.ocr_workers = as_int(scalars, "ocr_workers", out.ocr_workers);
   if (auto it = scalars.find("tesseract_lang"); it != scalars.end()) out.tesseract_lang = it->second;
@@ -104,6 +113,10 @@ bool save_heuristics(const std::string& path, const Heuristics& h, std::string& 
       {"min_text_layer_chars_per_page", h.min_text_layer_chars_per_page},
       {"paragraph_gap_pts", h.paragraph_gap_pts},
       {"line_merge_y_tol_pts", h.line_merge_y_tol_pts},
+      {"margin_overlay_max_x_frac", h.margin_overlay_max_x_frac},
+      {"sidebar_max_width_frac", h.sidebar_max_width_frac},
+      {"footnote_zone_start_frac", h.footnote_zone_start_frac},
+      {"min_text_quality", h.min_text_quality},
       {"ocr_dpi", static_cast<double>(h.ocr_dpi)},
       {"ocr_workers", static_cast<double>(h.ocr_workers)},
   };
@@ -116,6 +129,7 @@ bool save_heuristics(const std::string& path, const Heuristics& h, std::string& 
       {"keywords_as_h2", h.keywords_as_h2},
       {"nest_numeric_headings", h.nest_numeric_headings},
       {"footnotes_to_endnotes", h.footnotes_to_endnotes},
+      {"ocr_when_scan_present", h.ocr_when_scan_present},
   };
   return json_mini::write_object_file(path, scalars, arrays, numbers, booleans, err);
 }

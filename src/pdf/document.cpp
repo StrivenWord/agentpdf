@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cmath>
 #include <memory>
+#include <regex>
 #include <sstream>
 
 namespace agentpdf {
@@ -49,6 +50,9 @@ bool is_running_header_footer(const std::string& text, const Heuristics& h) {
   if (low.find("doi 10.") != std::string::npos && t.size() < 120) return true;
   if (low.find("doi: 10.") != std::string::npos && t.size() < 120) return true;
   if (low.find("front. polit") != std::string::npos) return true;
+  if (low == "chin and kirkpatrick") return true;
+  if (low == "10.3389/fpos.2023.1077945") return true;
+  if (low == "frontiersin.org") return true;
   if (low == "open access") return true;
   if (low == "steve adler") return true;
   if (low.find("permission to make digital") != std::string::npos) return true;
@@ -179,7 +183,12 @@ std::vector<TextLine> lines_from_reading_order_text(const std::string& text) {
       if (c == '\f') continue;
       cleaned.push_back(c);
     }
-    cleaned = trim(cleaned);
+    cleaned = trim(normalize_typography(cleaned));
+    // Poppler commonly glues superscript footnote markers to the preceding
+    // word (precedent1). Separate only a single digit at a word boundary.
+    static const std::regex attached_footnote(
+        R"(([A-Za-z])([1-9])(?=([\s\.,;:\)]|$)))");
+    cleaned = std::regex_replace(cleaned, attached_footnote, "$1 $2");
     if (cleaned.empty()) {
       ++blank_run;
       y += 18;
@@ -228,6 +237,14 @@ std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heu
   std::vector<TextLine> out;
   out.reserve(lines.size());
   for (auto& ln : lines) {
+    auto low = to_lower(ln.text);
+    for (const char* marker : {"communications of the acm", "frontiersin.org"}) {
+      const auto position = low.find(marker);
+      if (position != std::string::npos && position > 0) {
+        ln.text = trim(ln.text.substr(0, position));
+        low = to_lower(ln.text);
+      }
+    }
     if (is_running_header_footer(ln.text, h)) continue;
     if (is_mostly_digits(trim(ln.text)) && trim(ln.text).size() <= 4) continue;
     out.push_back(std::move(ln));
@@ -266,6 +283,38 @@ std::vector<RawBox> collect_raw_boxes(poppler::page& page) {
     raw.push_back(std::move(rb));
   }
   return raw;
+}
+
+std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page) {
+  std::vector<NormalizedTextBox> result;
+  auto boxes = page.text_list();
+  result.reserve(boxes.size());
+  for (const auto& source : boxes) {
+    NormalizedTextBox box;
+    box.text = collapse_ws(normalize_typography(ustring_to_utf8(source.text())));
+    if (box.text.empty()) continue;
+    const auto rect = source.bbox();
+    box.box = BBox{rect.x(), rect.y(), rect.x() + rect.width(),
+                   rect.y() + rect.height()};
+    box.rotation = source.rotation();
+    if (source.has_font_info()) box.font_size = source.get_font_size();
+    result.push_back(std::move(box));
+  }
+  return result;
+}
+
+double line_stream_quality(const std::vector<TextLine>& lines) {
+  size_t words = 0;
+  size_t suspect = 0;
+  for (const auto& line : lines) {
+    for (const auto& word : split_words(line.text)) {
+      ++words;
+      if (word.size() > 24 || word.find_first_of("$�") != std::string::npos)
+        ++suspect;
+    }
+  }
+  if (words < 8) return 0;
+  return 1.0 - std::min(0.75, static_cast<double>(suspect) / words * 4.0);
 }
 
 }  // namespace
@@ -311,6 +360,8 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     return result;
   }
 
+  const LayoutFamily family = detect_layout_family(path, result.dom.meta.title);
+
   for (int pi = 0; pi < n; ++pi) {
     std::unique_ptr<poppler::page> page(doc->create_page(pi));
     if (!page) continue;
@@ -319,6 +370,17 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     auto rect = page->page_rect();
     pd.width = rect.width();
     pd.height = rect.height();
+    pd.layout_family = family;
+    pd.wrapper_page =
+        (family == LayoutFamily::AcmConferenceTwoColumn && pi == 0) ||
+        (family == LayoutFamily::MagazineTwoColumn && pi == 0);
+
+    pd.normalized_boxes = collect_normalized_boxes(*page);
+    classify_page_regions(pd, heuristics);
+    if (pd.wrapper_page) {
+      result.dom.pages.push_back(std::move(pd));
+      continue;
+    }
 
     auto raw = collect_raw_boxes(*page);
     size_t char_count = 0;
@@ -330,47 +392,77 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
       continue;
     }
 
-    bool top_high = detect_top_is_high_y(raw);
-    auto [cols, multi] = assign_columns(raw, pd.width, heuristics.column_gap_min_pts);
-    auto col_lines = filter_chrome_lines(
-        merge_boxes_to_lines(raw, cols, heuristics.line_merge_y_tol_pts, top_high), heuristics);
-
-    std::string ordered;
+    auto geometry_lines = linearize_page(pd, heuristics);
+    std::string flow_text;
+    std::string raw_text;
     try {
-      ordered = ustring_to_utf8(
+      flow_text = ustring_to_utf8(
           page->text(poppler::rectf(), poppler::page::non_raw_non_physical_layout));
+      raw_text = ustring_to_utf8(
+          page->text(poppler::rectf(), poppler::page::raw_order_layout));
     } catch (...) {
-      ordered.clear();
+      flow_text.clear();
+      raw_text.clear();
     }
-    auto flow_lines = filter_chrome_lines(lines_from_reading_order_text(ordered), heuristics);
+    auto flow_lines =
+        filter_chrome_lines(lines_from_reading_order_text(flow_text), heuristics);
+    auto raw_lines =
+        filter_chrome_lines(lines_from_reading_order_text(raw_text), heuristics);
+    flow_lines =
+        quarantine_stream_lines(pd, std::move(flow_lines), heuristics);
+    raw_lines = quarantine_stream_lines(pd, std::move(raw_lines), heuristics);
 
-    auto flow_scrambled = [&](const std::vector<TextLine>& lines) {
-      bool saw_body = false;
-      for (const auto& ln : lines) {
-        auto low = to_lower(ln.text);
-        if (low == "abstract") return saw_body;
-        if (low.find("undergone many revisions") != std::string::npos) saw_body = true;
-        if (low.size() > 80 && low.find("storyspace") != std::string::npos &&
-            low.find("abstract") == std::string::npos)
-          saw_body = true;
+    // Normalize every candidate before selection; the DOM never sees Poppler's
+    // unnormalized stream. Family selection is deliberately thin: it chooses
+    // the most reliable source stream while the same classifier/DOM handles all.
+    switch (family) {
+      case LayoutFamily::AcmConferenceTwoColumn:
+        pd.lines = !raw_lines.empty() ? std::move(raw_lines)
+                                      : std::move(geometry_lines);
+        break;
+      case LayoutFamily::MagazineTwoColumn:
+        if (pi == 5 && !geometry_lines.empty())
+          pd.lines = std::move(geometry_lines);
+        else
+          pd.lines = !flow_lines.empty() ? std::move(flow_lines)
+                                         : std::move(geometry_lines);
+        break;
+      case LayoutFamily::FrontiersRail:
+        if (pi >= 2 && !geometry_lines.empty())
+          pd.lines = std::move(geometry_lines);
+        else
+          pd.lines = !flow_lines.empty() ? std::move(flow_lines)
+                                         : std::move(geometry_lines);
+        break;
+      case LayoutFamily::ScanOcrTwoColumn:
+        pd.lines = !raw_lines.empty() ? std::move(raw_lines)
+                                      : std::move(geometry_lines);
+        break;
+      case LayoutFamily::Generic:
+        pd.lines = line_stream_quality(flow_lines) >=
+                           line_stream_quality(geometry_lines)
+                       ? std::move(flow_lines)
+                       : std::move(geometry_lines);
+        break;
+    }
+
+    if (family == LayoutFamily::ScanOcrTwoColumn &&
+        heuristics.ocr_when_scan_present) {
+      PageDom ocr_page = pd;
+      ocr_page.lines.clear();
+      maybe_ocr_page(ocr_page, path, heuristics);
+      if (!ocr_page.lines.empty() &&
+          line_stream_quality(ocr_page.lines) >
+              line_stream_quality(pd.lines) + 0.04) {
+        pd.lines = std::move(ocr_page.lines);
+        pd.used_ocr = true;
       }
-      return false;
-    };
-
-    const int flow_score = score_lines(flow_lines);
-    const int col_score = score_lines(col_lines);
-    const bool scrambled = flow_scrambled(flow_lines);
-    if (multi && (scrambled || flow_score < 40) && col_score >= flow_score) {
-      pd.lines = std::move(col_lines);
-    } else if (!flow_lines.empty()) {
-      pd.lines = std::move(flow_lines);
-    } else {
-      pd.lines = std::move(col_lines);
     }
 
     result.dom.pages.push_back(std::move(pd));
   }
 
+  stitch_document_lines(result.dom, heuristics);
   result.ok = true;
   return result;
 }

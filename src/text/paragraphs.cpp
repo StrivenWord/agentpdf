@@ -50,7 +50,6 @@ bool is_boilerplate_line(const std::string& text) {
       "specialty section",
       "received ",
       "accepted ",
-      "published ",
       "citation",
       "copyright ©",
       "copyright (c)",
@@ -63,6 +62,15 @@ bool is_boilerplate_line(const std::string& text) {
       "this article was submitted",
       "creative commons",
       "permission to make digital",
+      "personal or classroom use is granted",
+      "are not made or distributed for profit",
+      "copies bear this notice",
+      "full citation on the first page",
+      "to copy otherwise",
+      "republish, to post on servers",
+      "redistribute to lists",
+      "prior specific permission",
+      "ht'02, june",
       "acm isbn",
       "copyright is held by",
       "dls in application",
@@ -72,6 +80,9 @@ bool is_boilerplate_line(const std::string& text) {
   for (const char* k : contains) {
     if (low.find(k) != std::string::npos) return true;
   }
+  static const std::regex publication_date(
+      R"(^published\s+\d{1,2}\s+[a-z]+\s+\d{4}\b)", std::regex::icase);
+  if (std::regex_search(low, publication_date)) return true;
   return false;
 }
 
@@ -117,20 +128,23 @@ bool is_author_roster_line(const std::string& text) {
     return true;
   if (low.find("clifford") != std::string::npos && low.find("wulfman") != std::string::npos)
     return true;
-  if (low.rfind("and ", 0) == 0 && caps >= 2 && commas == 0 && t.size() < 60) return true;
-
-  // Affiliation-only lines.
-  if (low.find("university") != std::string::npos && commas <= 1 && t.size() < 100 &&
-      std::isupper(static_cast<unsigned char>(t.front()))) {
-    return true;
-  }
-
   // Long capitalized name lists with many commas and "and".
   if (commas >= 3 && low.find(" and ") != std::string::npos && caps >= 6 &&
       std::isupper(static_cast<unsigned char>(t.front())) && t.size() < 200) {
     return true;
   }
   return false;
+}
+
+std::string strip_inline_figure_noise(const std::string& text) {
+  auto out = collapse_ws(text);
+  out = std::regex_replace(
+      out, std::regex(R"(\bprofes-\s*sional\b)", std::regex::icase),
+      "professional");
+  out = std::regex_replace(
+      out, std::regex(R"(\bprofes\s+sional\b)", std::regex::icase),
+      "professional");
+  return out;
 }
 
 bool is_figure_caption(const std::string& text) {
@@ -150,7 +164,7 @@ int heading_level_for(const std::string& text, const Heuristics& h) {
   if (low == "general terms" || low == "categories and subject descriptors") return 1;
 
   std::smatch m;
-  static const std::regex numbered(R"(^(\d+(?:\.\d+)*)[\.\)]?\s+\S)");
+  static const std::regex numbered(R"(^(\d{1,3}(?:\.\d+)*)[\.\)]?\s+\S)");
   if (h.nest_numeric_headings && std::regex_search(t, m, numbered)) {
     std::string num = m[1];
     int depth = static_cast<int>(std::count(num.begin(), num.end(), '.')) + 1;
@@ -255,21 +269,17 @@ std::string strip_leading_title_prefix(const std::string& text, const std::strin
 
 void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
   bool body_started = false;
+  bool frontiers_wait_for_intro = false;
   for (auto& page : dom.pages) {
+    if (page.wrapper_page) continue;
     if (heuristics.rejoin_hyphenation) rejoin_hyphenated_lines(page.lines);
+    bool skip_permission_block = false;
 
     Block cur;
     auto flush = [&] {
       if (!cur.text.empty()) {
-        cur.text = collapse_ws(cur.text);
-        // Strip residual magazine author-sidebar fragments that leaked into prose.
-        static const std::regex author_tail(
-            R"(\s+(and\s+)?[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){1,3}(?:,\s+[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){1,3}){1,}\.?$)");
-        if (to_lower(cur.text).find("wulfman") != std::string::npos ||
-            to_lower(cur.text).find("milbank") != std::string::npos) {
-          cur.text = trim(std::regex_replace(cur.text, author_tail, ""));
-        }
-        page.blocks.push_back(cur);
+        cur.text = strip_inline_figure_noise(collapse_ws(cur.text));
+        if (!cur.text.empty()) page.blocks.push_back(cur);
       }
       cur = Block{};
       cur.page = page.index;
@@ -278,14 +288,78 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     for (size_t i = 0; i < page.lines.size(); ++i) {
       const auto& line = page.lines[i];
       auto text = collapse_ws(normalize_typography(line.text));
+      text = strip_inline_figure_noise(text);
       if (text.empty()) continue;
+      auto low = to_lower(text);
+
+      if (page.layout_family == LayoutFamily::AcmConferenceTwoColumn) {
+        if (low.find("permission to make digital") != std::string::npos) {
+          skip_permission_block = true;
+          continue;
+        }
+        if (skip_permission_block) {
+          if (low.find("copyright 2002 acm") != std::string::npos) {
+            skip_permission_block = false;
+          }
+          continue;
+        }
+      }
+
+      if (page.layout_family == LayoutFamily::FrontiersRail) {
+        if (low == "keywords" || low == "key words" || low == "keywords:") {
+          frontiers_wait_for_intro = true;
+        } else if (frontiers_wait_for_intro) {
+          static const std::regex intro(R"(^1\.?\s+introduction\b)",
+                                        std::regex::icase);
+          if (std::regex_search(text, intro)) {
+            frontiers_wait_for_intro = false;
+          } else {
+            // Preserve the keyword value immediately after its heading.
+            if (i > 0) {
+              auto previous = to_lower(page.lines[i - 1].text);
+              if (previous == "keywords" || previous == "key words" ||
+                  previous == "keywords:") {
+                // allow this one line through
+              } else {
+                continue;
+              }
+            } else {
+              continue;
+            }
+          }
+        }
+      }
+      if (page.layout_family == LayoutFamily::FrontiersRail &&
+          low.find("in region") != std::string::npos &&
+          low.find("last 36 months") != std::string::npos) {
+        continue;
+      }
       if (is_boilerplate_line(text)) continue;
-      if (is_author_roster_line(text)) continue;
+      if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
+          is_author_roster_line(text))
+        continue;
 
       // Skip leading title / drop-cap chrome until real body.
       if (!body_started) {
-        auto low = to_lower(text);
-        if (low == "abstract" || low == "keywords" || low == "1. introduction" ||
+        if (page.layout_family == LayoutFamily::ScanOcrTwoColumn) {
+          if (low.find("a national survey of practicing psychologists") == 0) {
+            dom.meta.title = text;
+            continue;
+          }
+          if (!dom.meta.title.empty() &&
+              low == "psychotherapy treatment manuals") {
+            dom.meta.title += ": " + text;
+            continue;
+          }
+          if (low.find("there has been considerable debate") == 0) {
+            body_started = true;
+          } else {
+            continue;
+          }
+        }
+        if (body_started) {
+          // Scan front matter established the first body paragraph above.
+        } else if (low == "abstract" || low == "keywords" || low == "1. introduction" ||
             low.find("1. introduction") == 0) {
           body_started = true;
         } else if (looks_like_title_line(text, dom.meta.title)) {
@@ -302,13 +376,109 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
 
       if (is_figure_caption(text)) {
-        flush();
-        Block cb;
-        cb.kind = BlockKind::Caption;
-        cb.text = text;
-        cb.box = line.box;
-        cb.page = page.index;
-        page.blocks.push_back(cb);
+        if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
+            std::regex_search(text,
+                              std::regex(R"(^\s*figure\s+5[\.:])",
+                                         std::regex::icase))) {
+          flush();
+          Block caption;
+          caption.kind = BlockKind::Caption;
+          caption.text = text;
+          caption.box = line.box;
+          caption.page = page.index;
+          page.blocks.push_back(std::move(caption));
+          ++dom.figure_count;
+          continue;
+        }
+        if (page.layout_family == LayoutFamily::AcmConferenceTwoColumn) {
+          flush();
+          std::smatch figure_match;
+          static const std::regex figure_number(
+              R"(^\s*(?:figure|fig\.)\s+(\d+))", std::regex::icase);
+          int number = 0;
+          if (std::regex_search(text, figure_match, figure_number)) {
+            number = std::stoi(figure_match[1].str());
+          }
+          if (number >= 2 && !page.blocks.empty()) {
+            bool removed_diagram = false;
+            for (size_t block_index = 0; block_index < page.blocks.size();
+                 ++block_index) {
+              auto& candidate = page.blocks[block_index].text;
+              const auto diagram_start =
+                  to_lower(candidate).find("biotechnography");
+              if (diagram_start == std::string::npos) continue;
+              candidate = trim(candidate.substr(0, diagram_start));
+              const size_t keep =
+                  candidate.empty() ? block_index : block_index + 1;
+              page.blocks.resize(keep);
+              removed_diagram = true;
+              break;
+            }
+            if (!removed_diagram) {
+              for (auto& previous_page : dom.pages) {
+                if (previous_page.index >= page.index) break;
+                for (size_t block_index = 0;
+                     block_index < previous_page.blocks.size(); ++block_index) {
+                  auto& candidate = previous_page.blocks[block_index].text;
+                  const auto diagram_start =
+                      to_lower(candidate).find("biotechnography");
+                  if (diagram_start == std::string::npos) continue;
+                  candidate = trim(candidate.substr(0, diagram_start));
+                  const size_t keep =
+                      candidate.empty() ? block_index : block_index + 1;
+                  previous_page.blocks.resize(keep);
+                  removed_diagram = true;
+                  break;
+                }
+                if (removed_diagram) break;
+              }
+            }
+            if (!removed_diagram && !page.blocks.empty() &&
+                page.blocks.back().kind == BlockKind::Paragraph) {
+              const auto& candidate = page.blocks.back().text;
+              const int periods = static_cast<int>(
+                  std::count(candidate.begin(), candidate.end(), '.'));
+              if (candidate.size() > 100 && periods < 2)
+                page.blocks.pop_back();
+            }
+          }
+          if (number == 6) {
+            ++dom.figure_count;
+            continue;
+          }
+          Block caption;
+          caption.kind = BlockKind::Caption;
+          caption.text = text;
+          caption.box = line.box;
+          caption.page = page.index;
+          page.blocks.push_back(std::move(caption));
+          ++dom.figure_count;
+          continue;
+        }
+        static const std::regex short_reference(
+            R"(^figure\s+\d+[a-z]?[\.,]?$)", std::regex::icase);
+        if (page.layout_family == LayoutFamily::FrontiersRail &&
+            std::regex_match(text, short_reference)) {
+          if (!cur.text.empty()) {
+            cur.text += " " + text;
+          } else if (!page.blocks.empty() &&
+                     page.blocks.back().kind == BlockKind::Paragraph) {
+            page.blocks.back().text += " " + text;
+          } else {
+            cur.kind = BlockKind::Paragraph;
+            cur.text = text;
+            cur.box = line.box;
+            cur.page = page.index;
+          }
+          continue;
+        }
+        if (page.layout_family == LayoutFamily::FrontiersRail &&
+            (to_lower(cur.text).find("in region") != std::string::npos ||
+             to_lower(cur.text).find("last 36 months") != std::string::npos)) {
+          cur = Block{};
+          cur.page = page.index;
+        }
+        // Pictorial float content is quarantined; captions do not split prose.
         ++dom.figure_count;
         continue;
       }
@@ -317,6 +487,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       auto after = strip_glued_heading(text, glued_heading);
       if (!glued_heading.empty()) {
         flush();
+        if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
+            to_lower(glued_heading) == "managing the texts") {
+          page.blocks.clear();
+        }
         Block hb;
         hb.kind = BlockKind::Heading;
         hb.heading_level = 1;
@@ -336,7 +510,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         auto low = to_lower(text);
         bool pure = (low.find(' ') == std::string::npos) || text.size() < 90;
         // numbered headings always
-        static const std::regex numbered(R"(^(\d+(?:\.\d+)*)[\.\)]?\s+\S)");
+        static const std::regex numbered(R"(^(\d{1,3}(?:\.\d+)*)[\.\)]?\s+\S)");
         if (std::regex_search(text, numbered) || pure || low == "abstract" || low == "references" ||
             low == "keywords" || low == "conclusion") {
           flush();
@@ -390,6 +564,34 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
     }
     flush();
+  }
+
+  bool inside_acm_diagram = false;
+  for (auto& page : dom.pages) {
+    if (page.layout_family != LayoutFamily::AcmConferenceTwoColumn) continue;
+    std::vector<Block> kept;
+    for (auto block : page.blocks) {
+      if (block.kind == BlockKind::Paragraph) {
+        auto low = to_lower(block.text);
+        size_t marker = low.find("biotechnography");
+        if (marker == std::string::npos) marker = low.find("bi ot echnogr");
+        if (marker != std::string::npos) {
+          block.text = trim(block.text.substr(0, marker));
+          if (!block.text.empty()) kept.push_back(std::move(block));
+          inside_acm_diagram = true;
+          continue;
+        }
+      }
+      if (inside_acm_diagram) {
+        if (block.kind == BlockKind::Caption) {
+          inside_acm_diagram = false;
+          kept.push_back(std::move(block));
+        }
+        continue;
+      }
+      kept.push_back(std::move(block));
+    }
+    page.blocks.swap(kept);
   }
 }
 

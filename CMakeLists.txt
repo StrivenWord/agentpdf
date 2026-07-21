@@ -18,6 +18,7 @@ set(AGENTPDF_SOURCES
   src/config/load.cpp
   src/index/job_index.cpp
   src/pdf/document.cpp
+  src/layout/continuity.cpp
   src/layout/leptonica_analyze.cpp
   src/ocr/tesseract_page.cpp
   src/text/paragraphs.cpp
@@ -77,4 +78,11 @@ add_test(NAME word_order_candidate
     -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/candidate_paper_handmade.md
     -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
     -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
+)
+add_test(NAME continuity_addis_smoke
+  COMMAND ${CMAKE_COMMAND}
+    -DAGENTPDF=$<TARGET_FILE:agentpdf>
+    -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/ccp_addis2000.pdf
+    -DOUTDIR=${CMAKE_BINARY_DIR}/addis-smoke-out
+    -P ${CMAKE_SOURCE_DIR}/cmake/CheckContinuitySmoke.cmake
 )

@@ -16,6 +16,10 @@ struct Heuristics {
   double min_text_layer_chars_per_page = 40.0;
   double paragraph_gap_pts = 8.0;
   double line_merge_y_tol_pts = 2.5;
+  double margin_overlay_max_x_frac = 0.045;
+  double sidebar_max_width_frac = 0.30;
+  double footnote_zone_start_frac = 0.82;
+  double min_text_quality = 0.72;
   bool rejoin_hyphenation = true;
   bool strip_running_headers = true;
   bool strip_page_numbers = true;
@@ -24,9 +28,31 @@ struct Heuristics {
   bool keywords_as_h2 = true;
   bool nest_numeric_headings = true;
   bool footnotes_to_endnotes = true;
+  bool ocr_when_scan_present = true;
   int ocr_dpi = 300;
   int ocr_workers = 2;
   std::string tesseract_lang = "eng";
+};
+
+enum class RegionKind {
+  Body,
+  Header,
+  Footer,
+  MarginOverlay,
+  Sidebar,
+  Float,
+  Footnote,
+  AuthorNote,
+  Wrapper,
+  Metadata
+};
+
+enum class LayoutFamily {
+  Generic,
+  MagazineTwoColumn,
+  AcmConferenceTwoColumn,
+  FrontiersRail,
+  ScanOcrTwoColumn
 };
 
 struct MetadataSpec {
@@ -64,6 +90,15 @@ struct BBox {
   double height() const { return y1 - y0; }
   double cx() const { return (x0 + x1) * 0.5; }
   double cy() const { return (y0 + y1) * 0.5; }
+};
+
+struct NormalizedTextBox {
+  std::string text;
+  BBox box;
+  double font_size = 0;
+  int rotation = 0;
+  int column = 0;
+  RegionKind region = RegionKind::Body;
 };
 
 enum class BlockKind {
@@ -106,6 +141,10 @@ struct PageDom {
   double width = 0;
   double height = 0;
   bool used_ocr = false;
+  bool wrapper_page = false;
+  LayoutFamily layout_family = LayoutFamily::Generic;
+  double text_quality = 1.0;
+  std::vector<NormalizedTextBox> normalized_boxes;
   std::vector<TextLine> lines;
   std::vector<Block> blocks;
 };
