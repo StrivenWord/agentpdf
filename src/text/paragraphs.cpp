@@ -33,6 +33,22 @@ void rejoin_hyphenated_lines(std::vector<TextLine>& lines) {
 
 namespace {
 
+bool ends_sentence_like(const std::string& text) {
+  auto t = trim(text);
+  if (t.empty()) return false;
+  // Ignore trailing closers/quotes after the terminator.
+  size_t i = t.size();
+  while (i > 0) {
+    const char c = t[i - 1];
+    if (c == '"' || c == '\'' || c == ')' || c == ']' || c == '*') {
+      --i;
+      continue;
+    }
+    return c == '.' || c == '!' || c == '?';
+  }
+  return false;
+}
+
 bool is_boilerplate_line(const std::string& text) {
   auto low = to_lower(trim(text));
   if (low.empty()) return true;
@@ -537,7 +553,11 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         cur.text = text;
         cur.box = line.box;
         cur.page = page.index;
-      } else if (gap > heuristics.paragraph_gap_pts) {
+      } else if (gap > heuristics.paragraph_gap_pts &&
+                 ends_sentence_like(cur.text)) {
+        // Large synthetic gaps often come from Poppler blank lines or column
+        // wraps, not semantic paragraph boundaries. Only flush when the
+        // accumulated text already looks like a finished sentence.
         flush();
         cur.kind = BlockKind::Paragraph;
         cur.text = text;
@@ -554,6 +574,51 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
     }
     flush();
+  }
+
+  // PDF line/column/page object boundaries are not paragraph boundaries.
+  // Rejoin paragraph blocks that were split only because the previous text
+  // does not look like a finished sentence (typical mid-word page wraps).
+  auto append_paragraph = [](Block& dst, const Block& src) {
+    if (src.text.empty()) return;
+    if (!dst.text.empty() && dst.text.back() == '-') {
+      // Soft hyphen across a page/column break: drop the hyphen and glue.
+      dst.text.pop_back();
+      dst.text += src.text;
+    } else {
+      if (!dst.text.empty() && !src.text.empty()) dst.text.push_back(' ');
+      dst.text += src.text;
+    }
+    dst.box.y1 = std::max(dst.box.y1, src.box.y1);
+    dst.box.x0 = std::min(dst.box.x0, src.box.x0);
+    dst.box.x1 = std::max(dst.box.x1, src.box.x1);
+  };
+
+  for (auto& page : dom.pages) {
+    if (page.blocks.size() < 2) continue;
+    std::vector<Block> merged;
+    merged.reserve(page.blocks.size());
+    for (auto& block : page.blocks) {
+      if (!merged.empty() && merged.back().kind == BlockKind::Paragraph &&
+          block.kind == BlockKind::Paragraph &&
+          !ends_sentence_like(merged.back().text)) {
+        append_paragraph(merged.back(), block);
+        continue;
+      }
+      merged.push_back(std::move(block));
+    }
+    page.blocks.swap(merged);
+  }
+  for (size_t p = 1; p < dom.pages.size(); ++p) {
+    auto& prev = dom.pages[p - 1];
+    auto& cur = dom.pages[p];
+    if (prev.blocks.empty() || cur.blocks.empty()) continue;
+    auto& a = prev.blocks.back();
+    auto& b = cur.blocks.front();
+    if (a.kind != BlockKind::Paragraph || b.kind != BlockKind::Paragraph) continue;
+    if (ends_sentence_like(a.text)) continue;
+    append_paragraph(a, b);
+    cur.blocks.erase(cur.blocks.begin());
   }
 
   bool inside_acm_diagram = false;

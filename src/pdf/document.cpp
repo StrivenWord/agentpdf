@@ -193,7 +193,10 @@ std::vector<TextLine> lines_from_reading_order_text(const std::string& text) {
     cleaned = std::regex_replace(cleaned, attached_footnote, "$1 $2");
     if (cleaned.empty()) {
       ++blank_run;
-      y += 18;
+      // Keep blank-run gaps modest: Poppler inserts visual blanks at wraps and
+      // column breaks that are not semantic paragraphs. Sentence-boundary
+      // checks in build_blocks_from_lines decide real paragraph splits.
+      y += 12;
       continue;
     }
     if (!lines.empty() && blank_run == 0) {
