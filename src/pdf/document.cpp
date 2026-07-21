@@ -169,10 +169,7 @@ std::vector<TextLine> merge_boxes_to_lines(const std::vector<RawBox>& boxes,
     flush();
   }
   // Assign synthetic top-to-bottom y for paragraph gap detection.
-  for (size_t i = 0; i < lines.size(); ++i) {
-    lines[i].box.y0 = static_cast<double>(i) * 12.0;
-    lines[i].box.y1 = lines[i].box.y0 + 10.0;
-  }
+  renumber_synthetic_line_y(lines);
   return lines;
 }
 
@@ -205,8 +202,9 @@ std::vector<TextLine> lines_from_reading_order_text(const std::string& text) {
           std::islower(static_cast<unsigned char>(cleaned.front()))) {
         prev.text.pop_back();
         prev.text += cleaned;
+        // Do not advance y: the continuation belongs to the previous line.
+        // Advancing here left a synthetic gap that looked like a paragraph break.
         blank_run = 0;
-        y += 12;
         continue;
       }
     }
@@ -266,6 +264,8 @@ std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heu
     if (is_mostly_digits(trim(ln.text)) && trim(ln.text).size() <= 3) continue;
     out.push_back(std::move(ln));
   }
+  // Do not renumber here: flow text uses larger y gaps for Poppler blank lines
+  // that mark real paragraphs. Stitch/quarantine renumber after their erasures.
   return out;
 }
 
@@ -447,7 +447,8 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
                                          : std::move(geometry_lines);
         break;
       case LayoutFamily::FrontiersRail:
-        if (pi >= 2 && !geometry_lines.empty())
+        if ((pd.column_cut_override || pd.has_region_overrides || pi >= 2) &&
+            !geometry_lines.empty())
           pd.lines = std::move(geometry_lines);
         else
           pd.lines = !flow_lines.empty() ? std::move(flow_lines)

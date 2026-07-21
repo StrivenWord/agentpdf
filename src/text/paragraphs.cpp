@@ -28,6 +28,7 @@ void rejoin_hyphenated_lines(std::vector<TextLine>& lines) {
     out.push_back(lines[i]);
   }
   lines.swap(out);
+  renumber_synthetic_line_y(lines);
 }
 
 namespace {
@@ -524,9 +525,12 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
 
       double gap = 0;
-      if (!cur.text.empty() && i > 0) {
-        gap = line.box.y0 - page.lines[i - 1].box.y1;
-        if (gap < 0) gap = -gap;  // reading-order synthetic coords increase downward
+      if (!cur.text.empty()) {
+        // Gap against the accumulating paragraph, not raw array adjacency —
+        // stitch/chrome removals can leave holes in synthetic y if renumber
+        // was skipped.
+        gap = line.box.y0 - cur.box.y1;
+        if (gap < 0) gap = -gap;
       }
       if (cur.text.empty()) {
         cur.kind = BlockKind::Paragraph;

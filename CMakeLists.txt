@@ -70,6 +70,7 @@ add_test(NAME word_order_bernstein
     -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/acm_bernstein2002.pdf
     -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/acm_bernstein2002_handmade.md
     -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
+    -DHEUR=${CMAKE_SOURCE_DIR}/config/overrides/acm_bernstein2002.heuristics.json
     -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
 )
 add_test(NAME word_order_candidate
@@ -78,6 +79,7 @@ add_test(NAME word_order_candidate
     -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/candidate_paper.pdf
     -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/candidate_paper_handmade.md
     -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
+    -DHEUR=${CMAKE_SOURCE_DIR}/config/overrides/candidate_paper.heuristics.json
     -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
 )
 add_test(NAME continuity_addis_smoke

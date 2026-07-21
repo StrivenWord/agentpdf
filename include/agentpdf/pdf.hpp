@@ -27,6 +27,7 @@ std::vector<TextLine> quarantine_stream_lines(
     const PageDom& page, std::vector<TextLine> lines,
     const Heuristics& heuristics);
 void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics);
+void renumber_synthetic_line_y(std::vector<TextLine>& lines);
 
 bool rasterize_page_raw(const std::string& path, int page_index, int dpi,
                         std::vector<unsigned char>& raw_argb, int& width, int& height,

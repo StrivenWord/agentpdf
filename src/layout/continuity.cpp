@@ -493,10 +493,7 @@ std::vector<TextLine> linearize_page(const PageDom& page,
 
   // Downstream DOM construction needs only normalized stream order. Synthetic
   // coordinates make paragraph-gap logic deterministic across Poppler/OCR.
-  for (size_t i = 0; i < result.size(); ++i) {
-    result[i].box.y0 = static_cast<double>(i) * 12.0;
-    result[i].box.y1 = result[i].box.y0 + 10.0;
-  }
+  renumber_synthetic_line_y(result);
   return result;
 }
 
@@ -619,32 +616,45 @@ std::vector<TextLine> quarantine_stream_lines(
     }
     if (!remove) kept.push_back(std::move(line));
   }
+  renumber_synthetic_line_y(kept);
   return kept;
+}
+
+void renumber_synthetic_line_y(std::vector<TextLine>& lines) {
+  for (size_t i = 0; i < lines.size(); ++i) {
+    lines[i].box.y0 = static_cast<double>(i) * 12.0;
+    lines[i].box.y1 = lines[i].box.y0 + 10.0;
+  }
 }
 
 void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
   if (!heuristics.rejoin_hyphenation) return;
   for (auto& page : dom.pages) {
     for (size_t i = 1; i < page.lines.size(); ++i) {
-      auto& previous = page.lines[i - 1].text;
-      auto& current = page.lines[i].text;
-      if (!previous.empty() && previous.back() == '-' && !current.empty() &&
-          std::islower(static_cast<unsigned char>(current.front()))) {
-        previous.pop_back();
-        previous += current;
-        current.clear();
+      auto& previous = page.lines[i - 1];
+      auto& current = page.lines[i];
+      if (!previous.text.empty() && previous.text.back() == '-' &&
+          !current.text.empty() &&
+          std::islower(static_cast<unsigned char>(current.text.front()))) {
+        previous.text.pop_back();
+        previous.text += current.text;
+        previous.box.x1 = std::max(previous.box.x1, current.box.x1);
+        previous.box.y1 = std::max(previous.box.y1, current.box.y1);
+        current.text.clear();
       }
     }
     page.lines.erase(
         std::remove_if(page.lines.begin(), page.lines.end(),
                        [](const TextLine& line) { return line.text.empty(); }),
         page.lines.end());
+    renumber_synthetic_line_y(page.lines);
   }
   for (size_t page_index = 1; page_index < dom.pages.size(); ++page_index) {
     auto& previous_page = dom.pages[page_index - 1];
     auto& current_page = dom.pages[page_index];
     if (previous_page.lines.empty() || current_page.lines.empty()) continue;
-    auto& previous = previous_page.lines.back().text;
+    auto& previous_line = previous_page.lines.back();
+    auto& previous = previous_line.text;
     size_t current_index = 0;
     if (previous.ends_with(" tem")) {
       for (size_t i = 0; i < current_page.lines.size(); ++i) {
@@ -654,7 +664,8 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
         }
       }
     }
-    auto& current = current_page.lines[current_index].text;
+    auto& current_line = current_page.lines[current_index];
+    auto& current = current_line.text;
     bool join = !previous.empty() && previous.back() == '-';
     if (!join && previous.size() >= 3 && current.size() >= 5) {
       join = previous.ends_with(" tem") &&
@@ -663,11 +674,17 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
     if (join) {
       if (previous.back() == '-') previous.pop_back();
       previous += current;
+      previous_line.box.x1 = std::max(previous_line.box.x1, current_line.box.x1);
+      previous_line.box.y1 = std::max(previous_line.box.y1, current_line.box.y1);
       if (previous.find("temporal scope") != std::string::npos) {
         for (size_t i = 0; i < current_page.lines.size(); ++i) {
           if (to_lower(current_page.lines[i].text)
                   .rfind("shows the places", 0) == 0) {
             previous += " " + current_page.lines[i].text;
+            previous_line.box.x1 =
+                std::max(previous_line.box.x1, current_page.lines[i].box.x1);
+            previous_line.box.y1 =
+                std::max(previous_line.box.y1, current_page.lines[i].box.y1);
             current_page.lines.erase(
                 current_page.lines.begin() + static_cast<std::ptrdiff_t>(i));
             if (i < current_index) --current_index;
@@ -678,6 +695,10 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
           if (to_lower(current_page.lines[i].text)
                   .rfind("collection; and the maps", 0) == 0) {
             previous += " " + current_page.lines[i].text;
+            previous_line.box.x1 =
+                std::max(previous_line.box.x1, current_page.lines[i].box.x1);
+            previous_line.box.y1 =
+                std::max(previous_line.box.y1, current_page.lines[i].box.y1);
             current_page.lines.erase(
                 current_page.lines.begin() + static_cast<std::ptrdiff_t>(i));
             if (i < current_index) --current_index;
@@ -688,6 +709,10 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
           if (to_lower(current_page.lines[i].text)
                   .rfind("street in london", 0) == 0) {
             previous += " " + current_page.lines[i].text;
+            previous_line.box.x1 =
+                std::max(previous_line.box.x1, current_page.lines[i].box.x1);
+            previous_line.box.y1 =
+                std::max(previous_line.box.y1, current_page.lines[i].box.y1);
             current_page.lines.erase(
                 current_page.lines.begin() + static_cast<std::ptrdiff_t>(i));
             if (i < current_index) --current_index;
@@ -697,6 +722,8 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
       current_page.lines.erase(current_page.lines.begin() +
                                static_cast<std::ptrdiff_t>(current_index));
+      renumber_synthetic_line_y(current_page.lines);
+      renumber_synthetic_line_y(previous_page.lines);
     }
   }
 }

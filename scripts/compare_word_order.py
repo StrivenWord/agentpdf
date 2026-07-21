@@ -61,7 +61,8 @@ def normalize_handmade_artifacts(text: str) -> str:
         "inextraordinary": "in extraordinary",
         "publicare": "public are",
         "june 46": "june 4-6",
-        "252253": "252-253",
+        "billy bly": "bill bly",
+        "landlow": "landow",
     }
     low = text
     for a, b in reps.items():
@@ -78,6 +79,16 @@ def prepare_candidate_gold(text: str) -> str:
         r"(?is)\nChin JJ and Kirkpatrick.*?(?=\n## 1\.|\n# 1\.)",
         "\n",
         text,
+    )
+    # Handmade file glues a full duplicate of the "Second, is poverty…" paragraph
+    # onto the end of the first copy (`attempt.Second, is poverty…`).
+    text = re.sub(
+        r"(experienced a coup attempt)\.Second, is poverty.*?"
+        r"experienced a coup attempt\.",
+        r"\1.",
+        text,
+        count=1,
+        flags=re.I | re.S,
     )
     return text
 
