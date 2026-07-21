@@ -375,21 +375,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         }
       }
 
-      if (is_figure_caption(text)) {
-        if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
-            std::regex_search(text,
-                              std::regex(R"(^\s*figure\s+5[\.:])",
-                                         std::regex::icase))) {
-          flush();
-          Block caption;
-          caption.kind = BlockKind::Caption;
-          caption.text = text;
-          caption.box = line.box;
-          caption.page = page.index;
-          page.blocks.push_back(std::move(caption));
-          ++dom.figure_count;
-          continue;
-        }
+      if (is_figure_caption(text) && !page.keep_captions) {
         if (page.layout_family == LayoutFamily::AcmConferenceTwoColumn) {
           flush();
           std::smatch figure_match;

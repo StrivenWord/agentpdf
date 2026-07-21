@@ -8,6 +8,51 @@
 
 namespace agentpdf {
 
+enum class RegionKind {
+  Body,
+  Header,
+  Footer,
+  MarginOverlay,
+  Sidebar,
+  Float,
+  Footnote,
+  AuthorNote,
+  Wrapper,
+  Metadata
+};
+
+enum class LayoutFamily {
+  Generic,
+  MagazineTwoColumn,
+  AcmConferenceTwoColumn,
+  FrontiersRail,
+  ScanOcrTwoColumn
+};
+
+struct BBox {
+  double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  double width() const { return x1 - x0; }
+  double height() const { return y1 - y0; }
+  double cx() const { return (x0 + x1) * 0.5; }
+  double cy() const { return (y0 + y1) * 0.5; }
+};
+
+struct RegionOverride {
+  RegionKind role = RegionKind::Float;
+  BBox box;
+  bool fractional = false;
+  bool top_origin = true;
+};
+
+struct PageOverride {
+  int page = 0;
+  std::optional<double> column_cut;
+  bool cut_fractional = false;
+  bool cut_top_origin = true;
+  bool keep_captions = false;
+  std::vector<RegionOverride> regions;
+};
+
 struct Heuristics {
   double header_band_frac = 0.06;
   double footer_band_frac = 0.06;
@@ -32,27 +77,8 @@ struct Heuristics {
   int ocr_dpi = 300;
   int ocr_workers = 2;
   std::string tesseract_lang = "eng";
-};
-
-enum class RegionKind {
-  Body,
-  Header,
-  Footer,
-  MarginOverlay,
-  Sidebar,
-  Float,
-  Footnote,
-  AuthorNote,
-  Wrapper,
-  Metadata
-};
-
-enum class LayoutFamily {
-  Generic,
-  MagazineTwoColumn,
-  AcmConferenceTwoColumn,
-  FrontiersRail,
-  ScanOcrTwoColumn
+  std::vector<std::string> page_overrides_raw;
+  std::vector<PageOverride> page_overrides;
 };
 
 struct MetadataSpec {
@@ -82,14 +108,6 @@ struct DocumentMeta {
   std::string pages;
   std::vector<std::string> keywords;
   std::string abstract_text;
-};
-
-struct BBox {
-  double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-  double width() const { return x1 - x0; }
-  double height() const { return y1 - y0; }
-  double cx() const { return (x0 + x1) * 0.5; }
-  double cy() const { return (y0 + y1) * 0.5; }
 };
 
 struct NormalizedTextBox {
@@ -142,8 +160,11 @@ struct PageDom {
   double height = 0;
   bool used_ocr = false;
   bool wrapper_page = false;
+  bool keep_captions = false;
+  bool has_region_overrides = false;
   LayoutFamily layout_family = LayoutFamily::Generic;
   double text_quality = 1.0;
+  std::optional<double> column_cut_override;
   std::vector<NormalizedTextBox> normalized_boxes;
   std::vector<TextLine> lines;
   std::vector<Block> blocks;

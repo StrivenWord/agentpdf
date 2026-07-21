@@ -50,6 +50,18 @@ def normalize_handmade_artifacts(text: str) -> str:
         "ssince 2003": "since 2003",
         "storyspacetm": "storyspace",
         "exploretexts": "explore texts",
+        "possibleidioms": "possible idioms",
+        "generationand": "generation and",
+        "collectionare": "collection are",
+        "digital ibraries": "digital libraries",
+        "institutionsdddd our": "institutions. nevertheless our",
+        "institutionsdddd": "institutions. nevertheless",
+        "theones": "the ones",
+        "thedesign": "the design",
+        "inextraordinary": "in extraordinary",
+        "publicare": "public are",
+        "june 46": "june 4-6",
+        "252253": "252-253",
     }
     low = text
     for a, b in reps.items():
@@ -83,7 +95,12 @@ def words(text: str) -> list[str]:
         .replace("ﬂ", "fl")
         .replace("ï", "i")
     )
-    text = re.sub(r"([a-z0-9])-\s*([a-z0-9])", r"\1\2", text)
+    # Soft hyphenation (letter-letter). Also keep compounds like 1-year.
+    # Do not join digit-digit ranges (4-6, 252-253).
+    text = re.sub(r"([a-z])-\s*([a-z])", r"\1\2", text)
+    text = re.sub(r"(\d)-\s*([a-z])", r"\1\2", text)
+    # Normalize spaced unit compounds the handmade file sometimes uses.
+    text = re.sub(r"\b(\d+)\s+(year|years|month|months|day|days)\b", r"\1\2", text)
     return re.findall(r"[a-z0-9']+", text)
 
 

@@ -114,6 +114,41 @@ void append_box_text(std::string& line, const std::string& value) {
   line += value;
 }
 
+const PageOverride* find_page_override(const Heuristics& heuristics, int page) {
+  for (const auto& override_entry : heuristics.page_overrides) {
+    if (override_entry.page == page) return &override_entry;
+  }
+  return nullptr;
+}
+
+BBox to_page_points(const BBox& source, bool fractional, bool top_origin,
+                    double page_width, double page_height) {
+  BBox box = source;
+  if (fractional) {
+    box.x0 *= page_width;
+    box.x1 *= page_width;
+    box.y0 *= page_height;
+    box.y1 *= page_height;
+  }
+  if (!top_origin) {
+    const double y0 = page_height - box.y1;
+    const double y1 = page_height - box.y0;
+    box.y0 = y0;
+    box.y1 = y1;
+  }
+  if (box.x0 > box.x1) std::swap(box.x0, box.x1);
+  if (box.y0 > box.y1) std::swap(box.y0, box.y1);
+  return box;
+}
+
+double to_page_x(double value, bool fractional, double page_width) {
+  return fractional ? value * page_width : value;
+}
+
+bool point_in_box(const BBox& box, double x, double y) {
+  return x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1;
+}
+
 }  // namespace
 
 LayoutFamily detect_layout_family(const std::string& path,
@@ -166,6 +201,16 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
   if (page.wrapper_page) {
     for (auto& box : page.normalized_boxes) box.region = RegionKind::Wrapper;
     return;
+  }
+
+  if (const auto* override_entry = find_page_override(heuristics, page.index)) {
+    page.keep_captions = override_entry->keep_captions;
+    page.has_region_overrides = !override_entry->regions.empty();
+    if (override_entry->column_cut) {
+      page.column_cut_override =
+          to_page_x(*override_entry->column_cut, override_entry->cut_fractional,
+                    page.width);
+    }
   }
 
   const double top = page.height * heuristics.header_band_frac;
@@ -235,6 +280,20 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       box.region = RegionKind::Metadata;
       continue;
     }
+    if (const auto* override_entry = find_page_override(heuristics, page.index)) {
+      bool matched = false;
+      for (const auto& region : override_entry->regions) {
+        const BBox page_box =
+            to_page_points(region.box, region.fractional, region.top_origin,
+                           page.width, page.height);
+        if (point_in_box(page_box, box.box.cx(), box.box.cy())) {
+          box.region = region.role;
+          matched = true;
+          break;
+        }
+      }
+      if (matched) continue;
+    }
     if (page.layout_family == LayoutFamily::FrontiersRail &&
         (low == "chin and kirkpatrick" ||
          low.find("10.3389/fpos.2023.1077945") != std::string::npos ||
@@ -270,7 +329,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       continue;
     }
     if (page.layout_family != LayoutFamily::AcmConferenceTwoColumn &&
-        is_caption_seed(box)) {
+        !page.keep_captions && is_caption_seed(box)) {
       box.region = RegionKind::Float;
       continue;
     }
@@ -359,22 +418,6 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       }
     }
   }
-  if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
-      page.index == 5) {
-    double figure_five_y = -1;
-    for (const auto& box : page.normalized_boxes) {
-      if (to_lower(box.text) == "figure") figure_five_y = box.box.y0;
-    }
-    if (figure_five_y >= 0) {
-      for (auto& box : page.normalized_boxes) {
-        if (box.box.x0 < page.width * 0.55 &&
-            box.box.y0 >= figure_five_y - 2 &&
-            box.box.y0 <= figure_five_y + 65) {
-          box.region = RegionKind::Float;
-        }
-      }
-    }
-  }
 
   page.text_quality = score_text_quality(page.normalized_boxes);
 }
@@ -398,9 +441,7 @@ std::vector<TextLine> linearize_page(const PageDom& page,
     cut.reset();
   if (page.layout_family == LayoutFamily::FrontiersRail && page.index >= 2)
     cut = page.width * 0.5;
-  if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
-      page.index == 5)
-    cut = page.width * 0.50;
+  if (page.column_cut_override) cut = *page.column_cut_override;
 
   for (auto& box : body) {
     box.column = cut && box.box.cx() >= *cut ? 1 : 0;
@@ -502,22 +543,6 @@ std::vector<TextLine> quarantine_stream_lines(
     visual_lines.push_back(
         {to_lower(collapse_ws(current)), current_region});
 
-  std::string deferred_magazine_caption;
-  bool capture_magazine_caption = false;
-  for (const auto& visual : visual_lines) {
-    if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
-        visual.region == RegionKind::Float &&
-        visual.text.rfind("figure 5", 0) == 0) {
-      capture_magazine_caption = true;
-    }
-    if (capture_magazine_caption && visual.region == RegionKind::Float) {
-      if (!deferred_magazine_caption.empty())
-        deferred_magazine_caption.push_back(' ');
-      deferred_magazine_caption += visual.text;
-    }
-  }
-  bool inserted_magazine_caption = false;
-
   std::vector<TextLine> kept;
   for (auto line : lines) {
     line.text = collapse_ws(line.text);
@@ -592,20 +617,7 @@ std::vector<TextLine> quarantine_stream_lines(
         }
       }
     }
-    if (!remove) {
-      const bool insert_caption =
-          !inserted_magazine_caption &&
-          !deferred_magazine_caption.empty() &&
-          to_lower(line.text).find("see figure 5") != std::string::npos;
-      kept.push_back(std::move(line));
-      if (insert_caption) {
-        TextLine caption;
-        caption.text = deferred_magazine_caption;
-        caption.box = kept.back().box;
-        kept.push_back(std::move(caption));
-        inserted_magazine_caption = true;
-      }
-    }
+    if (!remove) kept.push_back(std::move(line));
   }
   return kept;
 }
@@ -627,55 +639,6 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
         std::remove_if(page.lines.begin(), page.lines.end(),
                        [](const TextLine& line) { return line.text.empty(); }),
         page.lines.end());
-  }
-  for (size_t page_index = 1; page_index < dom.pages.size(); ++page_index) {
-    auto& page = dom.pages[page_index];
-    if (page.layout_family != LayoutFamily::MagazineTwoColumn) continue;
-    double figure_five_y = -1;
-    bool figure_five_left = true;
-    for (const auto& box : page.normalized_boxes) {
-      if (box.region != RegionKind::Float ||
-          to_lower(box.text) != "figure")
-        continue;
-      for (const auto& number : page.normalized_boxes) {
-        if (number.region == RegionKind::Float &&
-            std::abs(number.box.y0 - box.box.y0) <= 2.5 &&
-            std::regex_match(number.text,
-                             std::regex(R"(^5[\.:]?$)"))) {
-          figure_five_y = box.box.y0;
-          figure_five_left = box.box.cx() < page.width * 0.5;
-          break;
-        }
-      }
-    }
-    if (figure_five_y < 0) continue;
-    std::vector<NormalizedTextBox> caption_boxes;
-    for (const auto& box : page.normalized_boxes) {
-      const bool in_caption_band =
-          figure_five_left ? box.box.x0 < page.width * 0.55
-                           : box.box.x1 > page.width * 0.45;
-      if (in_caption_band &&
-          box.box.y0 >= figure_five_y - 2 &&
-          box.box.y0 <= figure_five_y + 65) {
-        caption_boxes.push_back(box);
-      }
-    }
-    std::sort(caption_boxes.begin(), caption_boxes.end(),
-              [](const auto& a, const auto& b) {
-                if (std::abs(a.box.y0 - b.box.y0) > 2.5)
-                  return a.box.y0 < b.box.y0;
-                return a.box.x0 < b.box.x0;
-              });
-    TextLine caption;
-    double row = -1000;
-    for (const auto& box : caption_boxes) {
-      if (!caption.text.empty() && std::abs(box.box.y0 - row) > 2.5)
-        caption.text.push_back(' ');
-      append_box_text(caption.text, box.text);
-      row = box.box.y0;
-    }
-    caption.text = collapse_ws(caption.text);
-    if (!caption.text.empty()) dom.pages[page_index - 1].lines.push_back(caption);
   }
   for (size_t page_index = 1; page_index < dom.pages.size(); ++page_index) {
     auto& previous_page = dom.pages[page_index - 1];

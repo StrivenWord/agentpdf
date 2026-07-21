@@ -28,7 +28,11 @@ void print_heuristics(const Heuristics& h) {
             << "paragraph_gap_pts=" << h.paragraph_gap_pts << "\n"
             << "rejoin_hyphenation=" << (h.rejoin_hyphenation ? "true" : "false") << "\n"
             << "ocr_workers=" << h.ocr_workers << "\n"
-            << "ocr_dpi=" << h.ocr_dpi << "\n";
+            << "ocr_dpi=" << h.ocr_dpi << "\n"
+            << "page_overrides=" << h.page_overrides_raw.size() << "\n";
+  for (const auto& entry : h.page_overrides_raw) {
+    std::cout << "  " << entry << "\n";
+  }
 }
 
 bool set_heuristic(Heuristics& h, const std::string& key, const std::string& val) {
@@ -71,6 +75,7 @@ void run_interactive(Heuristics heuristics, MetadataSpec meta_spec,
                 << "  convert <pdf|dir>... [-o DIR]\n"
                 << "  show heuristics\n"
                 << "  set heuristic <key> <value>\n"
+                << "  load heuristics <path>\n"
                 << "  save heuristics [path]\n"
                 << "  jobs\n"
                 << "  help | quit\n";
@@ -85,6 +90,19 @@ void run_interactive(Heuristics heuristics, MetadataSpec meta_spec,
         std::cout << "unknown or invalid heuristic\n";
       } else {
         std::cout << "ok\n";
+      }
+      continue;
+    }
+    if (cmd == "load" && toks.size() >= 3 && toks[1] == "heuristics") {
+      std::string err;
+      Heuristics loaded;
+      if (!load_heuristics(toks[2], loaded, err)) {
+        std::cout << err << "\n";
+      } else {
+        heuristics = std::move(loaded);
+        std::cout << "loaded " << toks[2] << " ("
+                  << heuristics.page_overrides_raw.size()
+                  << " page_overrides)\n";
       }
       continue;
     }

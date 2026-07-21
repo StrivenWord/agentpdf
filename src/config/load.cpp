@@ -1,8 +1,11 @@
 #include "agentpdf/config.hpp"
 #include "agentpdf/util.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -39,6 +42,173 @@ bool as_bool(const std::map<std::string, std::string>& scalars, const std::strin
   if (v == "true" || v == "1") return true;
   if (v == "false" || v == "0") return false;
   return fallback;
+}
+
+RegionKind region_kind_from_name(const std::string& name) {
+  const auto low = to_lower(name);
+  if (low == "header") return RegionKind::Header;
+  if (low == "footer") return RegionKind::Footer;
+  if (low == "sidebar") return RegionKind::Sidebar;
+  if (low == "footnote") return RegionKind::Footnote;
+  if (low == "float") return RegionKind::Float;
+  if (low == "margin" || low == "marginoverlay" || low == "margin_overlay")
+    return RegionKind::MarginOverlay;
+  if (low == "metadata") return RegionKind::Metadata;
+  if (low == "wrapper") return RegionKind::Wrapper;
+  if (low == "authornote" || low == "author_note") return RegionKind::AuthorNote;
+  return RegionKind::Float;
+}
+
+std::vector<std::string> split_semi(const std::string& value) {
+  std::vector<std::string> parts;
+  std::string cur;
+  for (char c : value) {
+    if (c == ';') {
+      auto piece = trim(cur);
+      if (!piece.empty()) parts.push_back(piece);
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  auto piece = trim(cur);
+  if (!piece.empty()) parts.push_back(piece);
+  return parts;
+}
+
+bool parse_box(const std::string& text, BBox& out) {
+  std::stringstream ss(text);
+  std::string token;
+  double vals[4];
+  int n = 0;
+  while (std::getline(ss, token, ',') && n < 4) {
+    try {
+      vals[n++] = std::stod(trim(token));
+    } catch (...) {
+      return false;
+    }
+  }
+  if (n != 4) return false;
+  out = BBox{vals[0], vals[1], vals[2], vals[3]};
+  return true;
+}
+
+bool parse_page_override_entry(const std::string& raw, PageOverride& out,
+                               std::string& err) {
+  out = PageOverride{};
+  bool have_page = false;
+  bool fractional = false;
+  bool top_origin = true;
+  RegionKind pending_role = RegionKind::Float;
+  bool have_region = false;
+  BBox pending_box;
+  bool have_box = false;
+
+  for (const auto& part : split_semi(raw)) {
+    const auto eq = part.find('=');
+    if (eq == std::string::npos) {
+      err = "page_overrides entry missing '=': " + part;
+      return false;
+    }
+    const auto key = to_lower(trim(part.substr(0, eq)));
+    const auto value = trim(part.substr(eq + 1));
+    if (key == "page") {
+      try {
+        out.page = std::stoi(value);
+        have_page = true;
+      } catch (...) {
+        err = "invalid page in page_overrides: " + value;
+        return false;
+      }
+    } else if (key == "units") {
+      const auto low = to_lower(value);
+      if (low == "frac" || low == "fraction" || low == "relative")
+        fractional = true;
+      else if (low == "pt" || low == "points" || low == "point")
+        fractional = false;
+      else {
+        err = "invalid units in page_overrides: " + value;
+        return false;
+      }
+    } else if (key == "origin") {
+      const auto low = to_lower(value);
+      if (low == "topleft" || low == "top-left" || low == "tl")
+        top_origin = true;
+      else if (low == "bottomleft" || low == "bottom-left" || low == "bl")
+        top_origin = false;
+      else {
+        err = "invalid origin in page_overrides: " + value;
+        return false;
+      }
+    } else if (key == "region") {
+      pending_role = region_kind_from_name(value);
+      have_region = true;
+    } else if (key == "box") {
+      if (!parse_box(value, pending_box)) {
+        err = "invalid box in page_overrides: " + value;
+        return false;
+      }
+      have_box = true;
+    } else if (key == "column_cut" || key == "column-cut") {
+      try {
+        out.column_cut = std::stod(value);
+      } catch (...) {
+        err = "invalid column_cut in page_overrides: " + value;
+        return false;
+      }
+    } else if (key == "keep_captions" || key == "keep-captions") {
+      const auto low = to_lower(value);
+      out.keep_captions = (low == "true" || low == "1" || low == "yes");
+    } else {
+      err = "unknown page_overrides key: " + key;
+      return false;
+    }
+  }
+
+  if (!have_page) {
+    err = "page_overrides entry requires page=: " + raw;
+    return false;
+  }
+  out.cut_fractional = fractional;
+  out.cut_top_origin = top_origin;
+  if (have_box || have_region) {
+    if (!have_box) {
+      err = "page_overrides region requires box=: " + raw;
+      return false;
+    }
+    RegionOverride region;
+    region.role = have_region ? pending_role : RegionKind::Float;
+    region.box = pending_box;
+    region.fractional = fractional;
+    region.top_origin = top_origin;
+    out.regions.push_back(region);
+  }
+  return true;
+}
+
+void parse_page_overrides(Heuristics& out) {
+  out.page_overrides.clear();
+  for (const auto& raw : out.page_overrides_raw) {
+    PageOverride parsed;
+    std::string err;
+    if (!parse_page_override_entry(raw, parsed, err)) {
+      std::cerr << "warning: skipping page_overrides entry (" << err << ")\n";
+      continue;
+    }
+    auto existing = std::find_if(out.page_overrides.begin(), out.page_overrides.end(),
+                                 [&](const PageOverride& p) { return p.page == parsed.page; });
+    if (existing == out.page_overrides.end()) {
+      out.page_overrides.push_back(std::move(parsed));
+      continue;
+    }
+    if (parsed.column_cut) {
+      existing->column_cut = parsed.column_cut;
+      existing->cut_fractional = parsed.cut_fractional;
+      existing->cut_top_origin = parsed.cut_top_origin;
+    }
+    if (parsed.keep_captions) existing->keep_captions = true;
+    for (auto& region : parsed.regions) existing->regions.push_back(std::move(region));
+  }
 }
 
 }  // namespace
@@ -90,6 +260,10 @@ bool load_heuristics(const std::string& path, Heuristics& out, std::string& err)
   out.ocr_dpi = as_int(scalars, "ocr_dpi", out.ocr_dpi);
   out.ocr_workers = as_int(scalars, "ocr_workers", out.ocr_workers);
   if (auto it = scalars.find("tesseract_lang"); it != scalars.end()) out.tesseract_lang = it->second;
+  if (auto it = arrays.find("page_overrides"); it != arrays.end()) {
+    out.page_overrides_raw = it->second;
+  }
+  parse_page_overrides(out);
   return true;
 }
 
@@ -104,7 +278,9 @@ bool load_metadata_spec(const std::string& path, MetadataSpec& out, std::string&
 
 bool save_heuristics(const std::string& path, const Heuristics& h, std::string& err) {
   std::map<std::string, std::string> scalars{{"tesseract_lang", h.tesseract_lang}};
-  std::map<std::string, std::vector<std::string>> arrays;
+  std::map<std::string, std::vector<std::string>> arrays{
+      {"page_overrides", h.page_overrides_raw},
+  };
   std::map<std::string, double> numbers{
       {"header_band_frac", h.header_band_frac},
       {"footer_band_frac", h.footer_band_frac},

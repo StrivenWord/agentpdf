@@ -7,7 +7,7 @@
   "paragraph_gap_pts": 8.0,
   "line_merge_y_tol_pts": 2.5,
   "margin_overlay_max_x_frac": 0.045,
-  "sidebar_max_width_frac": 0.30,
+  "sidebar_max_width_frac": 0.3,
   "footnote_zone_start_frac": 0.82,
   "min_text_quality": 0.72,
   "rejoin_hyphenation": true,
@@ -22,5 +22,8 @@
   "ocr_dpi": 300,
   "ocr_workers": 2,
   "tesseract_lang": "eng",
-  "page_overrides": []
+  "page_overrides": [
+    "page=4; region=float; units=pt; origin=topleft; box=100,90,346,785",
+    "page=5; column_cut=348; units=pt; origin=topleft; keep_captions=true"
+  ]
 }

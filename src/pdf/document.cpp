@@ -41,7 +41,7 @@ bool is_running_header_footer(const std::string& text, const Heuristics& h) {
   auto t = collapse_ws(text);
   auto low = to_lower(t);
   if (t.empty()) return true;
-  if (h.strip_page_numbers && is_mostly_digits(t) && t.size() <= 4) return true;
+  if (h.strip_page_numbers && is_mostly_digits(t) && t.size() <= 3) return true;
   if (low.find("communications of the acm") != std::string::npos) return true;
   if (low.find("vol.") != std::string::npos &&
       (low.find("no.") != std::string::npos || low.find("/vol.") != std::string::npos))
@@ -64,6 +64,11 @@ bool is_running_header_footer(const std::string& text, const Heuristics& h) {
   if (low.find("conference sponsors") != std::string::npos) return true;
   if (low.find("latest updates") != std::string::npos) return true;
   if (low.find("doi.org/") != std::string::npos && t.size() < 100) return true;
+  // Magazine end-ornaments and stray drop-cap leftovers.
+  if (t.size() == 1 && !std::isdigit(static_cast<unsigned char>(t[0]))) {
+    const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(t[0])));
+    if (c != 'a' && c != 'i') return true;
+  }
   return false;
 }
 
@@ -245,8 +250,20 @@ std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heu
         low = to_lower(ln.text);
       }
     }
+    // Drop a trailing single-letter ornament (e.g. magazine end mark "c").
+    if (ln.text.size() >= 3) {
+      const auto last = ln.text.back();
+      const auto prev = ln.text[ln.text.size() - 2];
+      if (std::isspace(static_cast<unsigned char>(prev)) &&
+          std::isalpha(static_cast<unsigned char>(last)) &&
+          std::tolower(static_cast<unsigned char>(last)) != 'a' &&
+          std::tolower(static_cast<unsigned char>(last)) != 'i') {
+        ln.text = trim(ln.text.substr(0, ln.text.size() - 1));
+        low = to_lower(ln.text);
+      }
+    }
     if (is_running_header_footer(ln.text, h)) continue;
-    if (is_mostly_digits(trim(ln.text)) && trim(ln.text).size() <= 4) continue;
+    if (is_mostly_digits(trim(ln.text)) && trim(ln.text).size() <= 3) continue;
     out.push_back(std::move(ln));
   }
   return out;
@@ -392,7 +409,8 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
       continue;
     }
 
-    auto geometry_lines = linearize_page(pd, heuristics);
+    auto geometry_lines =
+        filter_chrome_lines(linearize_page(pd, heuristics), heuristics);
     std::string flow_text;
     std::string raw_text;
     try {
@@ -421,7 +439,8 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
                                       : std::move(geometry_lines);
         break;
       case LayoutFamily::MagazineTwoColumn:
-        if (pi == 5 && !geometry_lines.empty())
+        if ((pd.column_cut_override || pd.has_region_overrides) &&
+            !geometry_lines.empty())
           pd.lines = std::move(geometry_lines);
         else
           pd.lines = !flow_lines.empty() ? std::move(flow_lines)

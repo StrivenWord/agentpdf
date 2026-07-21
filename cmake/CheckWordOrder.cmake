@@ -1,8 +1,13 @@
 # Word-order golden check for agentpdf outputs.
 # Expects: AGENTPDF, PDF, GOLD, OUTDIR
+# Optional: HEUR (path to heuristics JSON)
 
 if(NOT AGENTPDF OR NOT PDF OR NOT GOLD OR NOT OUTDIR)
   message(FATAL_ERROR "AGENTPDF, PDF, GOLD, OUTDIR required")
+endif()
+
+if(NOT HEUR)
+  set(HEUR "${CMAKE_CURRENT_LIST_DIR}/../config/heuristics.json")
 endif()
 
 file(MAKE_DIRECTORY "${OUTDIR}")
@@ -11,7 +16,7 @@ set(OUT_MD "${OUTDIR}/${STEM}.md")
 
 execute_process(
   COMMAND "${AGENTPDF}" convert "${PDF}" -o "${OUTDIR}"
-          --heuristics "${CMAKE_CURRENT_LIST_DIR}/../config/heuristics.json"
+          --heuristics "${HEUR}"
           --metadata "${CMAKE_CURRENT_LIST_DIR}/../config/metadata.json"
   WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/.."
   RESULT_VARIABLE RC

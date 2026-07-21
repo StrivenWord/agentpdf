@@ -61,6 +61,7 @@ add_test(NAME word_order_crane
     -DPDF=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/source-pdfs/acm_crane2001.pdf
     -DGOLD=${CMAKE_SOURCE_DIR}/../unit-testing/md-rendering/handmade-extractions/acm_crane2001_handmade.md
     -DOUTDIR=${CMAKE_BINARY_DIR}/test-out
+    -DHEUR=${CMAKE_SOURCE_DIR}/config/overrides/acm_crane2001.heuristics.json
     -P ${CMAKE_SOURCE_DIR}/cmake/CheckWordOrder.cmake
 )
 add_test(NAME word_order_bernstein
