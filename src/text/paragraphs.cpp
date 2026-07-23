@@ -103,6 +103,37 @@ bool is_boilerplate_line(const std::string& text) {
   return false;
 }
 
+// Stream-level complement to mark_post_references_ancillary: once References
+// has been seen, drop publisher tear-out / claims-form bands that survive
+// geometry quarantine (common when OCR replaces the quarantined stream).
+bool is_post_references_ancillary_start(const std::string& text) {
+  auto low = to_lower(trim(text));
+  if (low.empty()) return false;
+  static const char* markers[] = {
+      "subscription claims",
+      "we provide this form",
+      "print full name or key name",
+      "please print clearly and in ink",
+      "to be filled out by",
+      "please do not remove",
+      "photocopy may be used",
+      "member or customer number",
+      "apa subscription claims",
+  };
+  for (const char* m : markers) {
+    if (low.find(m) != std::string::npos) return true;
+  }
+  // Publisher masthead above tear-out forms (OCR often truncates ASSOCIATION).
+  if (low.rfind("american psychological", 0) == 0 && low.size() < 80) {
+    return true;
+  }
+  if (low.find("american psychological association") != std::string::npos &&
+      low.find("subscription") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
 bool is_author_roster_line(const std::string& text) {
   auto t = trim(text);
   if (t.size() < 10 || t.size() > 280) return false;
@@ -287,10 +318,12 @@ std::string strip_leading_title_prefix(const std::string& text, const std::strin
 void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
   bool body_started = false;
   bool frontiers_wait_for_intro = false;
+  bool references_seen = false;
   for (auto& page : dom.pages) {
     if (page.wrapper_page) continue;
     if (heuristics.rejoin_hyphenation) rejoin_hyphenated_lines(page.lines);
     bool skip_permission_block = false;
+    bool drop_ancillary = false;
 
     Block cur;
     auto flush = [&] {
@@ -308,6 +341,13 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       text = strip_inline_figure_noise(text);
       if (text.empty()) continue;
       auto low = to_lower(text);
+
+      if (references_seen &&
+          (drop_ancillary || is_post_references_ancillary_start(text))) {
+        flush();
+        drop_ancillary = true;
+        continue;
+      }
 
       if (page.layout_family == LayoutFamily::AcmConferenceTwoColumn) {
         if (low.find("permission to make digital") != std::string::npos) {
@@ -503,6 +543,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         hb.page = page.index;
         page.blocks.push_back(hb);
         ++dom.heading_count;
+        if (to_lower(glued_heading) == "references" ||
+            to_lower(glued_heading) == "bibliography") {
+          references_seen = true;
+        }
         if (after.empty()) continue;
         text = after;
       }
@@ -525,6 +569,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           hb.page = page.index;
           page.blocks.push_back(hb);
           ++dom.heading_count;
+          if (low == "references" || low == "bibliography" ||
+              low == "works cited") {
+            references_seen = true;
+          }
           continue;
         }
       }

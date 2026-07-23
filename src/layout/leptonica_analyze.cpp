@@ -1,4 +1,5 @@
 #include "agentpdf/pdf.hpp"
+#include "agentpdf/simd.hpp"
 
 #include <leptonica/allheaders.h>
 
@@ -18,15 +19,12 @@ bool leptonica_analyze_raw(const unsigned char* argb, int width, int height, int
     err = "pixCreate failed";
     return false;
   }
+  l_uint32* data = pixGetData(pix);
+  int wpl = pixGetWpl(pix);
   for (int y = 0; y < height; ++y) {
-    const unsigned char* row = argb + static_cast<size_t>(y) * static_cast<size_t>(bytes_per_row);
-    for (int x = 0; x < width; ++x) {
-      const unsigned char* px = row + x * 4;
-      l_uint32 val;
-      unsigned char r = px[1], g = px[2], b = px[3];
-      composeRGBPixel(r, g, b, &val);
-      pixSetPixel(pix, x, y, val);
-    }
+    const unsigned char* src = argb + static_cast<size_t>(y) * static_cast<size_t>(bytes_per_row);
+    unsigned char* dst = reinterpret_cast<unsigned char*>(data + static_cast<size_t>(y) * wpl);
+    argb_to_leptonica_row(src, dst, width);
   }
 
   PIX* gray = pixConvertRGBToGray(pix, 0.0f, 0.0f, 0.0f);

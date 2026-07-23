@@ -1,4 +1,5 @@
 #include "agentpdf/pdf.hpp"
+#include "agentpdf/thread_pool.hpp"
 #include "agentpdf/util.hpp"
 
 #include <poppler-document.h>
@@ -272,19 +273,33 @@ std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heu
   return out;
 }
 
-void maybe_ocr_page(PageDom& pd, const std::string& path, const Heuristics& heuristics) {
+struct OcrJob {
+  int page_index = 0;
+  bool candidate = false;  // true: compare OCR against native lines; false: use OCR directly
+};
+
+struct OcrPageResult {
+  int page_index = -1;
+  std::vector<TextLine> lines;
+  bool used_ocr = false;
+};
+
+OcrPageResult run_ocr_job(const std::string& path, int page_index, const Heuristics& heuristics) {
+  OcrPageResult res;
+  res.page_index = page_index;
   std::vector<unsigned char> raw;
   int w = 0, h = 0, bpr = 0;
   std::string err;
-  if (!rasterize_page_raw(path, pd.index, heuristics.ocr_dpi, raw, w, h, bpr, err)) return;
+  if (!rasterize_page_raw(path, page_index, heuristics.ocr_dpi, raw, w, h, bpr, err)) return res;
   double skew = 0;
   std::vector<BBox> regions;
   leptonica_analyze_raw(raw.data(), w, h, bpr, skew, regions, err);
   std::vector<TextLine> ocr_lines;
-  if (tesseract_ocr_page(raw.data(), w, h, bpr, heuristics, ocr_lines, err)) {
-    pd.lines = std::move(ocr_lines);
-    pd.used_ocr = true;
+  if (tesseract_ocr_page_thread_local(raw.data(), w, h, bpr, heuristics, ocr_lines, err)) {
+    res.lines = std::move(ocr_lines);
+    res.used_ocr = true;
   }
+  return res;
 }
 
 std::vector<RawBox> collect_raw_boxes(poppler::page& page) {
@@ -381,6 +396,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   }
 
   const LayoutFamily family = detect_layout_family(path, result.dom.meta.title);
+  bool references_active = false;
+  std::vector<OcrJob> ocr_jobs;
+  ocr_jobs.reserve(n);
 
   for (int pi = 0; pi < n; ++pi) {
     std::unique_ptr<poppler::page> page(doc->create_page(pi));
@@ -397,6 +415,15 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
 
     pd.normalized_boxes = collect_normalized_boxes(*page);
     classify_page_regions(pd, heuristics);
+    for (const auto& box : pd.normalized_boxes) {
+      auto low = to_lower(trim(box.text));
+      if (low == "references" || low == "bibliography" || low == "works cited" ||
+          (low.rfind("references", 0) == 0 && low.size() <= 14)) {
+        references_active = true;
+        break;
+      }
+    }
+    if (references_active) mark_post_references_ancillary(pd, true);
     if (pd.wrapper_page) {
       result.dom.pages.push_back(std::move(pd));
       continue;
@@ -407,7 +434,7 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     for (const auto& b : raw) char_count += b.text.size();
 
     if (static_cast<double>(char_count) < heuristics.min_text_layer_chars_per_page) {
-      maybe_ocr_page(pd, path, heuristics);
+      ocr_jobs.push_back({pi, false});
       result.dom.pages.push_back(std::move(pd));
       continue;
     }
@@ -471,18 +498,43 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
 
     if (family == LayoutFamily::ScanOcrTwoColumn &&
         heuristics.ocr_when_scan_present) {
-      PageDom ocr_page = pd;
-      ocr_page.lines.clear();
-      maybe_ocr_page(ocr_page, path, heuristics);
-      if (!ocr_page.lines.empty() &&
-          line_stream_quality(ocr_page.lines) >
-              line_stream_quality(pd.lines) + 0.04) {
-        pd.lines = std::move(ocr_page.lines);
-        pd.used_ocr = true;
-      }
+      ocr_jobs.push_back({pi, true});
     }
 
     result.dom.pages.push_back(std::move(pd));
+  }
+
+  // Run all collected OCR work in parallel using the configured worker count.
+  // Each worker thread reuses a single tesseract::TessBaseAPI instance for the
+  // lifetime of the pool, avoiding the per-page Init/End overhead that dominated
+  // OCR runtime on low-power machines.
+  if (!ocr_jobs.empty()) {
+    std::vector<OcrPageResult> ocr_results(result.dom.pages.size());
+    ThreadPool pool(static_cast<size_t>(std::max(1, heuristics.ocr_workers)));
+    std::mutex results_mutex;
+    for (const auto& job : ocr_jobs) {
+      pool.submit([&]() {
+        auto res = run_ocr_job(path, job.page_index, heuristics);
+        std::lock_guard<std::mutex> lock(results_mutex);
+        ocr_results[job.page_index] = std::move(res);
+      });
+    }
+    pool.wait_for_all();
+
+    for (const auto& job : ocr_jobs) {
+      const auto& res = ocr_results[job.page_index];
+      if (res.page_index < 0 || res.lines.empty()) continue;
+      auto& page = result.dom.pages[job.page_index];
+      if (job.candidate) {
+        if (line_stream_quality(res.lines) > line_stream_quality(page.lines) + 0.04) {
+          page.lines = quarantine_stream_lines(page, std::move(res.lines), heuristics);
+          page.used_ocr = true;
+        }
+      } else {
+        page.lines = std::move(res.lines);
+        page.used_ocr = true;
+      }
+    }
   }
 
   stitch_document_lines(result.dom, heuristics);

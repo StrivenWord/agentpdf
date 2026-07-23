@@ -22,6 +22,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
 LayoutFamily detect_layout_family(const std::string& path, const std::string& title);
 double score_text_quality(const std::vector<NormalizedTextBox>& boxes);
 void classify_page_regions(PageDom& page, const Heuristics& heuristics);
+// After a References section, quarantine full-width / form-like back matter
+// that appears once two-column bibliography structure collapses (Approach C).
+void mark_post_references_ancillary(PageDom& page, bool references_active);
 std::vector<TextLine> linearize_page(const PageDom& page, const Heuristics& heuristics);
 std::vector<TextLine> quarantine_stream_lines(
     const PageDom& page, std::vector<TextLine> lines,
@@ -46,5 +49,21 @@ bool leptonica_analyze_raw(const unsigned char* argb, int width, int height, int
 bool tesseract_ocr_page(const unsigned char* argb, int width, int height, int bytes_per_row,
                         const Heuristics& heuristics, std::vector<TextLine>& lines_out,
                         std::string& err);
+
+}  // namespace agentpdf
+
+namespace tesseract {
+class TessBaseAPI;
+}
+
+namespace agentpdf {
+
+bool tesseract_ocr_page_with_api(tesseract::TessBaseAPI& api, const unsigned char* argb,
+                                 int width, int height, int bytes_per_row,
+                                 const Heuristics& heuristics,
+                                 std::vector<TextLine>& lines_out, std::string& err);
+bool tesseract_ocr_page_thread_local(const unsigned char* argb, int width, int height,
+                                     int bytes_per_row, const Heuristics& heuristics,
+                                     std::vector<TextLine>& lines_out, std::string& err);
 
 }  // namespace agentpdf

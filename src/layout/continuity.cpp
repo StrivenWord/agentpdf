@@ -422,6 +422,144 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
   page.text_quality = score_text_quality(page.normalized_boxes);
 }
 
+bool is_references_heading_text(const std::string& text) {
+  auto low = to_lower(trim(text));
+  if (low == "references" || low == "bibliography" || low == "works cited") {
+    return true;
+  }
+  // Allow a trailing colon or short ornament.
+  return low.rfind("references", 0) == 0 && low.size() <= 14;
+}
+
+bool region_looks_like_publisher_ancillary(
+    const PageDom& page, double from_y) {
+  bool saw_wide = false;
+  bool saw_formish = false;
+  bool saw_appendix = false;
+  auto has = [](const std::string& low, std::initializer_list<const char*> needles) {
+    for (const char* n : needles) {
+      if (low.find(n) != std::string::npos) return true;
+    }
+    return false;
+  };
+  for (const auto& box : page.normalized_boxes) {
+    if (box.box.y0 + 1.0 < from_y) continue;
+    const auto low = to_lower(box.text);
+    if (low.empty()) continue;
+    if (low.rfind("appendix", 0) == 0 || low.rfind("acknowledg", 0) == 0) {
+      saw_appendix = true;
+    }
+    if (box.box.width() > page.width * 0.55) saw_wide = true;
+    if (has(low, {"subscription claims", "we provide this form",
+                  "print full name", "please print clearly",
+                  "to be filled out by", "please do not remove",
+                  "photocopy may be used", "member or customer",
+                  "today's date", "subscription claims information"})) {
+      saw_formish = true;
+    }
+    // Centered publisher masthead above a tear-out form.
+    if (low.rfind("american psychological", 0) == 0 && box.text.size() < 80) {
+      saw_formish = true;
+    }
+    if (low.find("american psychological association") != std::string::npos &&
+        box.text.size() < 80) {
+      saw_formish = true;
+    }
+  }
+  if (saw_appendix && !saw_formish) return false;
+  return saw_wide || saw_formish;
+}
+
+void mark_post_references_ancillary(PageDom& page, bool references_active) {
+  if (!references_active || page.wrapper_page) return;
+  if (page.width <= 0 || page.normalized_boxes.empty()) return;
+
+  double refs_heading_y = -1.0;
+  for (const auto& box : page.normalized_boxes) {
+    if (is_references_heading_text(box.text)) {
+      refs_heading_y = box.box.y0;
+      break;
+    }
+  }
+  // Cross-page continuation: still look for collapse on later pages.
+  const double y_floor = refs_heading_y >= 0.0 ? refs_heading_y + 4.0 : 0.0;
+
+  struct RowBand {
+    double y = 0;
+    bool left = false;
+    bool right = false;
+    double max_width = 0;
+  };
+  std::vector<RowBand> bands;
+  const double mid = page.width * 0.5;
+  for (const auto& box : page.normalized_boxes) {
+    if (box.region != RegionKind::Body) continue;
+    if (box.box.y0 < y_floor) continue;
+    if (trim(box.text).empty()) continue;
+    // Skip ultra-narrow margin fragments when assessing columns.
+    if (box.box.width() < page.width * 0.04) continue;
+
+    bool merged = false;
+    for (auto& band : bands) {
+      if (std::abs(band.y - box.box.y0) <= 3.0) {
+        band.y = (band.y + box.box.y0) * 0.5;
+        if (box.box.cx() < mid - 8.0) band.left = true;
+        if (box.box.cx() > mid + 8.0) band.right = true;
+        band.max_width = std::max(band.max_width, box.box.width());
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      RowBand band;
+      band.y = box.box.y0;
+      band.left = box.box.cx() < mid - 8.0;
+      band.right = box.box.cx() > mid + 8.0;
+      band.max_width = box.box.width();
+      bands.push_back(band);
+    }
+  }
+  if (bands.empty()) return;
+  std::sort(bands.begin(), bands.end(),
+            [](const RowBand& a, const RowBand& b) { return a.y < b.y; });
+
+  double last_two_col_y = -1.0;
+  for (const auto& band : bands) {
+    if (band.left && band.right) last_two_col_y = band.y;
+  }
+  if (last_two_col_y < 0.0) return;
+
+  double median_height = 12.0;
+  {
+    std::vector<double> heights;
+    for (const auto& box : page.normalized_boxes) {
+      if (box.box.height() > 0) heights.push_back(box.box.height());
+    }
+    if (!heights.empty()) {
+      auto middle =
+          heights.begin() + static_cast<std::ptrdiff_t>(heights.size() / 2);
+      std::nth_element(heights.begin(), middle, heights.end());
+      median_height = std::max(8.0, *middle);
+    }
+  }
+  const double gap_tol = std::max(14.0, median_height * 1.6);
+
+  double drop_y = -1.0;
+  for (const auto& band : bands) {
+    if (band.y <= last_two_col_y + gap_tol) continue;
+    drop_y = band.y;
+    break;
+  }
+  if (drop_y < 0.0) return;
+  if (!region_looks_like_publisher_ancillary(page, drop_y)) return;
+
+  for (auto& box : page.normalized_boxes) {
+    if (box.box.y0 + 1.0 >= drop_y) {
+      box.region = RegionKind::Metadata;
+    }
+  }
+}
+
 std::vector<TextLine> linearize_page(const PageDom& page,
                                      const Heuristics& heuristics) {
   std::vector<NormalizedTextBox> body;

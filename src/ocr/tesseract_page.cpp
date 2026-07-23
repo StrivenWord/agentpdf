@@ -1,18 +1,21 @@
 #include "agentpdf/pdf.hpp"
+#include "agentpdf/simd.hpp"
 #include "agentpdf/util.hpp"
 
 #include <leptonica/allheaders.h>
 #include <tesseract/baseapi.h>
 
 #include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace agentpdf {
 
-bool tesseract_ocr_page(const unsigned char* argb, int width, int height, int bytes_per_row,
-                        const Heuristics& heuristics, std::vector<TextLine>& lines_out,
-                        std::string& err) {
+bool tesseract_ocr_page_with_api(tesseract::TessBaseAPI& api, const unsigned char* argb,
+                                 int width, int height, int bytes_per_row,
+                                 const Heuristics& heuristics,
+                                 std::vector<TextLine>& lines_out, std::string& err) {
   lines_out.clear();
   if (!argb || width <= 0 || height <= 0) {
     err = "invalid image for tesseract";
@@ -24,26 +27,14 @@ bool tesseract_ocr_page(const unsigned char* argb, int width, int height, int by
   for (int y = 0; y < height; ++y) {
     const unsigned char* src = argb + static_cast<size_t>(y) * static_cast<size_t>(bytes_per_row);
     unsigned char* dst = rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
-    for (int x = 0; x < width; ++x) {
-      // Approximate ARGB -> RGBA
-      dst[x * 4 + 0] = src[x * 4 + 1];
-      dst[x * 4 + 1] = src[x * 4 + 2];
-      dst[x * 4 + 2] = src[x * 4 + 3];
-      dst[x * 4 + 3] = src[x * 4 + 0];
-    }
+    argb_to_rgba_row(src, dst, width);
   }
 
-  tesseract::TessBaseAPI api;
-  if (api.Init(nullptr, heuristics.tesseract_lang.c_str())) {
-    err = "tesseract init failed";
-    return false;
-  }
   api.SetImage(rgba.data(), width, height, 4, width * 4);
   api.SetSourceResolution(heuristics.ocr_dpi);
   char* text = api.GetUTF8Text();
   if (!text) {
     err = "tesseract returned no text";
-    api.End();
     return false;
   }
   std::istringstream iss(text);
@@ -59,8 +50,40 @@ bool tesseract_ocr_page(const unsigned char* argb, int width, int height, int by
     y += 14;
   }
   delete[] text;
-  api.End();
   return true;
+}
+
+bool tesseract_ocr_page(const unsigned char* argb, int width, int height, int bytes_per_row,
+                        const Heuristics& heuristics, std::vector<TextLine>& lines_out,
+                        std::string& err) {
+  tesseract::TessBaseAPI api;
+  if (api.Init(nullptr, heuristics.tesseract_lang.c_str())) {
+    err = "tesseract init failed";
+    return false;
+  }
+  bool ok = tesseract_ocr_page_with_api(api, argb, width, height, bytes_per_row, heuristics,
+                                        lines_out, err);
+  api.End();
+  return ok;
+}
+
+bool tesseract_ocr_page_thread_local(const unsigned char* argb, int width, int height,
+                                     int bytes_per_row, const Heuristics& heuristics,
+                                     std::vector<TextLine>& lines_out, std::string& err) {
+  thread_local std::unique_ptr<tesseract::TessBaseAPI> api;
+  thread_local std::string api_lang;
+  if (!api || api_lang != heuristics.tesseract_lang) {
+    api.reset();
+    api = std::make_unique<tesseract::TessBaseAPI>();
+    if (api->Init(nullptr, heuristics.tesseract_lang.c_str())) {
+      err = "tesseract init failed";
+      api.reset();
+      return false;
+    }
+    api_lang = heuristics.tesseract_lang;
+  }
+  return tesseract_ocr_page_with_api(*api, argb, width, height, bytes_per_row, heuristics,
+                                     lines_out, err);
 }
 
 }  // namespace agentpdf
