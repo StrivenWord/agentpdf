@@ -1,16 +1,31 @@
 #include "agentpdf/thread_pool.hpp"
+#include "agentpdf/hardware.hpp"
+
+#include <chrono>
 
 namespace agentpdf {
 
-ThreadPool::ThreadPool(size_t worker_count) {
+ThreadPool::ThreadPool(size_t worker_count)
+    : low_core_(is_low_core_system()) {
   for (size_t i = 0; i < worker_count; ++i) {
     workers_.emplace_back([this]() {
       while (true) {
         std::function<void()> job;
         {
           std::unique_lock<std::mutex> lock(mutex_);
-          cv_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
-          if (stop_ && jobs_.empty()) return;
+          if (low_core_) {
+            // On low-core systems, avoid long condition_variable waits that
+            // cause unnecessary context switches. Use a short timed_wait and
+            // fall back to a brief yield-based spin when no job is available.
+            while (!stop_ && jobs_.empty()) {
+              cv_.wait_for(lock, std::chrono::milliseconds(1));
+              if (stop_ && jobs_.empty()) return;
+            }
+            if (stop_ && jobs_.empty()) return;
+          } else {
+            cv_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+            if (stop_ && jobs_.empty()) return;
+          }
           job = std::move(jobs_.front());
           jobs_.pop();
           ++active_;

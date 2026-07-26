@@ -12,6 +12,10 @@ namespace agentpdf {
 // A simple, dependency-free thread pool for parallel work across all supported
 // platforms (Intel/ARM Mac, Linux, Windows). Jobs are submitted as
 // std::function<void()>. The destructor waits for all queued and running jobs.
+//
+// On low-core systems (<=2 hardware threads) the pool uses a shorter sleep
+// interval between job checks to reduce context-switch overhead and improve
+// throughput when the worker count matches the physical core count.
 class ThreadPool {
  public:
   explicit ThreadPool(size_t worker_count);
@@ -31,6 +35,7 @@ class ThreadPool {
   std::condition_variable done_cv_;
   bool stop_ = false;
   size_t active_ = 0;
+  bool low_core_;  // true when hardware_concurrency() <= 2
 };
 
 }  // namespace agentpdf

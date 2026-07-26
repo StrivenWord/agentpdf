@@ -1,5 +1,6 @@
 #include "agentpdf/pdf.hpp"
 #include "agentpdf/thread_pool.hpp"
+#include "agentpdf/hardware.hpp"
 #include "agentpdf/util.hpp"
 
 #include <poppler-document.h>
@@ -510,7 +511,7 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   // OCR runtime on low-power machines.
   if (!ocr_jobs.empty()) {
     std::vector<OcrPageResult> ocr_results(result.dom.pages.size());
-    ThreadPool pool(static_cast<size_t>(std::max(1, heuristics.ocr_workers)));
+    ThreadPool pool(recommended_ocr_workers());
     std::mutex results_mutex;
     for (const auto& job : ocr_jobs) {
       pool.submit([&]() {

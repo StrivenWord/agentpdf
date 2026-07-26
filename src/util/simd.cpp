@@ -24,6 +24,25 @@ bool cpu_has_avx2() {
 #endif
 }
 
+bool cpu_has_sse42() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#if defined(__GNUC__) || defined(__clang__)
+  static const bool has = __builtin_cpu_supports("sse4.2");
+  return has;
+#elif defined(_MSC_VER)
+#include <intrin.h>
+  int info[4] = {0};
+  __cpuid(info, 1);
+  static const bool has = (info[2] & (1 << 19)) != 0;
+  return has;
+#else
+  return false;
+#endif
+#else
+  return false;
+#endif
+}
+
 // Forward declarations for the x86 AVX2 helpers.  These are only defined when
 // AGENTPDF_HAS_AVX2_PATH is set by CMake (i.e., x86-64/x86 build with the AVX2
 // file enabled), so the calls below are guarded by both the macro and the
@@ -33,10 +52,23 @@ extern void avx2_argb_to_rgba_row(const unsigned char* src, unsigned char* dst, 
 extern void avx2_argb_to_leptonica_row(const unsigned char* src, unsigned char* dst, int width);
 #endif
 
+// Forward declarations for the x86 SSE4.2/SSSE3 helpers.  These are only defined
+// when AGENTPDF_HAS_SSE42_PATH is set by CMake.
+#if defined(AGENTPDF_HAS_SSE42_PATH) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+extern void sse42_argb_to_rgba_row(const unsigned char* src, unsigned char* dst, int width);
+extern void sse42_argb_to_leptonica_row(const unsigned char* src, unsigned char* dst, int width);
+#endif
+
 void argb_to_rgba_row(const unsigned char* src, unsigned char* dst, int width) {
 #if defined(AGENTPDF_HAS_AVX2_PATH) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
   if (cpu_has_avx2()) {
     avx2_argb_to_rgba_row(src, dst, width);
+    return;
+  }
+#endif
+#if defined(AGENTPDF_HAS_SSE42_PATH) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+  if (cpu_has_sse42()) {
+    sse42_argb_to_rgba_row(src, dst, width);
     return;
   }
 #endif
@@ -52,6 +84,12 @@ void argb_to_leptonica_row(const unsigned char* src, unsigned char* dst, int wid
 #if defined(AGENTPDF_HAS_AVX2_PATH) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
   if (cpu_has_avx2()) {
     avx2_argb_to_leptonica_row(src, dst, width);
+    return;
+  }
+#endif
+#if defined(AGENTPDF_HAS_SSE42_PATH) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+  if (cpu_has_sse42()) {
+    sse42_argb_to_leptonica_row(src, dst, width);
     return;
   }
 #endif

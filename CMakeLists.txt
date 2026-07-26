@@ -6,15 +6,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Architecture detection for the optional x86 AVX2 pixel-conversion fast path.
-# This path is intentionally isolated to a single source file and is never
+# Architecture detection for the optional x86 SIMD pixel-conversion fast paths.
+# These paths are intentionally isolated to single source files and are never
 # compiled on ARM64 or other non-x86 targets.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86|x86|ia32)$")
   set(AGENTPDF_IS_X86 TRUE)
 else()
   set(AGENTPDF_IS_X86 FALSE)
 endif()
-option(AGENTPDF_ENABLE_AVX2 "Enable AVX2 pixel-format fast path on x86-64/x86" ${AGENTPDF_IS_X86})
+option(AGENTPDF_ENABLE_AVX2 "Enable AVX2 pixel-conversion fast path on x86-64/x86" ${AGENTPDF_IS_X86})
+option(AGENTPDF_ENABLE_SSE42 "Enable SSE4.2/SSSE3 pixel-conversion fast path on x86 (fallback when AVX2 unavailable)" ${AGENTPDF_IS_X86})
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
@@ -50,6 +51,11 @@ if (AGENTPDF_ENABLE_AVX2)
   add_compile_definitions(AGENTPDF_HAS_AVX2_PATH)
 endif()
 
+if (AGENTPDF_ENABLE_SSE42)
+  list(APPEND AGENTPDF_SOURCES src/util/pixel_convert_x86_sse.cpp)
+  add_compile_definitions(AGENTPDF_HAS_SSE42_PATH)
+endif()
+
 add_executable(agentpdf ${AGENTPDF_SOURCES})
 
 target_include_directories(agentpdf PRIVATE
@@ -72,6 +78,18 @@ if (AGENTPDF_ENABLE_AVX2)
   endif()
 else()
   message(STATUS "agentpdf: AVX2 pixel-conversion fast path disabled")
+endif()
+
+if (AGENTPDF_ENABLE_SSE42)
+  message(STATUS "agentpdf: SSE4.2/SSSE3 pixel-conversion fast path enabled")
+  if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/util/pixel_convert_x86_sse.cpp PROPERTIES COMPILE_OPTIONS "-mssse3;-msse4.2")
+  elseif (MSVC)
+    # MSVC: SSE4.2 is baseline for x64; SSSE3 requires /arch:SSE2 or higher
+    set_source_files_properties(src/util/pixel_convert_x86_sse.cpp PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+  endif()
+else()
+  message(STATUS "agentpdf: SSE4.2/SSSE3 pixel-conversion fast path disabled")
 endif()
 
 # Ship default configs next to the build tree for local runs.
