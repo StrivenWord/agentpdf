@@ -29,3 +29,6 @@ run-reports/
 scripts/__pycache__/
 __pycache__/
 *.pyc
+# macOS metadata
+._*
+.DS_Store
