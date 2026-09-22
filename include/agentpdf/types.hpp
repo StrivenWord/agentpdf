@@ -114,6 +114,7 @@ struct NormalizedTextBox {
   std::string text;
   BBox box;
   double font_size = 0;
+  bool bold = false;  // from the font name; only collected for front-matter evidence
   int rotation = 0;
   int column = 0;
   RegionKind region = RegionKind::Body;
@@ -175,6 +176,14 @@ struct PageDom {
 struct DocumentDom {
   std::string source_path;
   DocumentMeta meta;
+  // Raw PDF Info-dictionary strings. They are evidence, not truth: metadata
+  // extraction cross-checks them against the text layer before use.
+  std::string info_title;
+  std::string info_author;
+  // Front-matter evidence: every text box (all regions, font sizes included)
+  // of the first pages, used only for metadata. Body classification keeps
+  // using PageDom::normalized_boxes.
+  std::vector<std::vector<NormalizedTextBox>> front_boxes;
   std::vector<PageDom> pages;
   std::vector<std::string> endnotes;
   int heading_count = 0;

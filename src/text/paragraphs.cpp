@@ -1,8 +1,10 @@
+#include "agentpdf/frontmatter.hpp"
 #include "agentpdf/pdf.hpp"
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <regex>
 #include <sstream>
 
@@ -200,7 +202,7 @@ bool is_figure_caption(const std::string& text) {
   return low.find("figure ") == 0 || low.find("fig. ") == 0 || low.find("table ") == 0;
 }
 
-int heading_level_for(const std::string& text, const Heuristics& h) {
+int heading_level_for(const std::string& text, const Heuristics& h, bool magazine) {
   auto t = trim(text);
   auto low = to_lower(t);
   if (low == "abstract" || low == "references" || low == "conclusion" ||
@@ -209,17 +211,30 @@ int heading_level_for(const std::string& text, const Heuristics& h) {
     return 1;
   }
   if (low == "keywords" || low == "key words") return h.keywords_as_h2 ? 2 : 1;
+  switch (front_label_of(t)) {
+    case FrontLabel::Abstract:
+    case FrontLabel::Introduction:
+      return 1;
+    case FrontLabel::Keywords:
+      return h.keywords_as_h2 ? 2 : 1;
+    case FrontLabel::None:
+      break;
+  }
   if (low == "general terms" || low == "categories and subject descriptors") return 1;
 
   std::smatch m;
-  static const std::regex numbered(R"(^(\d{1,3}(?:\.\d+)*)[\.\)]?\s+\S)");
+  // Section numbers are followed by a capitalised title; a wrapped prose line
+  // that happens to begin with a quantity ("200 acres of…", "6 - 1 vote") is
+  // not a heading.
+  static const std::regex numbered(R"(^(\d{1,3}(?:\.\d+)*)[\.\)]?\s+[^a-z\s\-])");
   if (h.nest_numeric_headings && std::regex_search(t, m, numbered)) {
     std::string num = m[1];
     int depth = static_cast<int>(std::count(num.begin(), num.end(), '.')) + 1;
     return std::min(depth, 6);
   }
 
-  // Known unnumbered section titles (ACM magazine style).
+  // Known unnumbered section titles of the Communications of the ACM
+  // fixture; only meaningful inside that template.
   static const char* sections[] = {
       "challenges for the humanities",
       "case studies for general problems",
@@ -233,7 +248,7 @@ int heading_level_for(const std::string& text, const Heuristics& h) {
   for (const char* s : sections) {
     if (low == s) return 1;
     // Heading glued to following sentence: "Space and Time Although..."
-    if (low.find(std::string(s) + " ") == 0) return 1;
+    if (magazine && low.find(std::string(s) + " ") == 0) return 1;
   }
 
   if (t.size() < 80 && t.find('.') == std::string::npos) {
@@ -249,7 +264,12 @@ int heading_level_for(const std::string& text, const Heuristics& h) {
   return 0;
 }
 
-std::string strip_glued_heading(const std::string& text, std::string& heading_out) {
+std::string strip_glued_heading(const std::string& text, std::string& heading_out,
+                                bool magazine) {
+  heading_out.clear();
+  // The glued-heading list is the Communications of the ACM fixture's section
+  // inventory; applying it elsewhere splits ordinary sentences.
+  if (!magazine) return text;
   auto low = to_lower(text);
   static const char* sections[] = {
       "challenges for the humanities",
@@ -313,15 +333,125 @@ std::string strip_leading_title_prefix(const std::string& text, const std::strin
   return trim(out);
 }
 
+struct BodyAnchor {
+  size_t page = 0;
+  size_t line = 0;
+};
+
+// Where the article body begins: the earliest of (a) an Abstract, Keywords or
+// Introduction label and (b) the first run of sustained prose, searched over
+// the first three content pages. Title blocks, bylines, affiliations and
+// masthead lines before it are front matter. Without either signal the body
+// starts at the first line: never discard a whole document.
+std::string alnum_lower(const std::string& s) {
+  std::string out;
+  for (unsigned char c : s) {
+    if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
+    else if (c >= 0x80) out.push_back(static_cast<char>(c));
+  }
+  return out;
+}
+
+// Does sustained prose begin at lines[i]? Wide-column text shows it in one
+// line; narrow magazine columns (3-7 words per line) only across a short run
+// of consecutive lines. Lines belonging to the printed title never qualify.
+bool starts_prose_run(const std::vector<TextLine>& lines, size_t i,
+                      const std::string& folded_title) {
+  auto norm = [&](size_t k) { return collapse_ws(normalize_typography(lines[k].text)); };
+  const auto first = norm(i);
+  const size_t first_words = split_words(first).size();
+  if (first_words < 3 || lowercase_word_share(first) < 0.5) return false;
+  if (is_provenance_line(first) || is_boilerplate_line(first)) return false;
+  const auto folded_first = alnum_lower(first);
+  if (!folded_title.empty() && folded_first.size() >= 6 &&
+      folded_title.find(folded_first) != std::string::npos)
+    return false;
+  if (is_prose_line(first)) {
+    const bool continues = i + 1 < lines.size() && split_words(norm(i + 1)).size() >= 5;
+    if (first_words >= 20 || continues) return true;
+  }
+  size_t words = 0;
+  double lower = 0;
+  size_t run = 0;
+  for (size_t j = i; j < lines.size() && j < i + 5; ++j) {
+    const auto t = norm(j);
+    const size_t wc = split_words(t).size();
+    if (wc < 3 || is_provenance_line(t)) break;
+    words += wc;
+    lower += lowercase_word_share(t) * static_cast<double>(wc);
+    ++run;
+  }
+  return run >= 3 && words >= 15 && lower / static_cast<double>(words) >= 0.55;
+}
+
+BodyAnchor find_body_anchor(const DocumentDom& dom) {
+  const std::string folded_title = alnum_lower(dom.meta.title);
+  std::optional<BodyAnchor> label_anchor;
+  std::optional<BodyAnchor> prose_anchor;
+  std::optional<BodyAnchor> first_line;
+  int content_pages = 0;
+  for (const auto& page : dom.pages) {
+    if (page.wrapper_page || page.lines.empty()) continue;
+    if (++content_pages > 3) break;
+    const auto p = static_cast<size_t>(page.index);
+    if (!first_line) first_line = BodyAnchor{p, 0};
+    for (size_t i = 0; i < page.lines.size(); ++i) {
+      const auto text = collapse_ws(normalize_typography(page.lines[i].text));
+      if (text.empty()) continue;
+      if (!label_anchor) {
+        std::string label, rest;
+        const auto kind = split_front_label(text, label, rest);
+        if (kind != FrontLabel::None) label_anchor = BodyAnchor{p, i};
+      }
+      if (!prose_anchor && starts_prose_run(page.lines, i, folded_title)) {
+        // A lowercase start continues a sentence whose opening words sit on
+        // the previous line (magazine lead-ins set in capitals after a drop
+        // cap). Take that line too when it is not a label or the title.
+        size_t start = i;
+        const auto first = collapse_ws(normalize_typography(page.lines[i].text));
+        if (i > 0 && std::islower(static_cast<unsigned char>(first.front()))) {
+          const auto prev = collapse_ws(normalize_typography(page.lines[i - 1].text));
+          const auto folded_prev = alnum_lower(prev);
+          const bool ends_sentence = !prev.empty() && (prev.back() == '.' || prev.back() == ':');
+          if (split_words(prev).size() >= 2 && !ends_sentence &&
+              front_label_of(prev) == FrontLabel::None && !is_provenance_line(prev) &&
+              (folded_title.empty() || folded_title.find(folded_prev) == std::string::npos))
+            start = i - 1;
+        }
+        prose_anchor = BodyAnchor{p, start};
+      }
+      if (label_anchor && prose_anchor) break;
+    }
+    if (label_anchor && prose_anchor) break;
+  }
+  auto earlier = [](const BodyAnchor& a, const BodyAnchor& b) {
+    return a.page < b.page || (a.page == b.page && a.line < b.line);
+  };
+  if (label_anchor && prose_anchor)
+    return earlier(*label_anchor, *prose_anchor) ? *label_anchor : *prose_anchor;
+  if (label_anchor) return *label_anchor;
+  if (prose_anchor) return *prose_anchor;
+  return first_line.value_or(BodyAnchor{});
+}
+
 }  // namespace
 
 void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
+  if (heuristics.rejoin_hyphenation) {
+    for (auto& page : dom.pages) {
+      if (!page.wrapper_page) rejoin_hyphenated_lines(page.lines);
+    }
+  }
+  const BodyAnchor anchor = find_body_anchor(dom);
   bool body_started = false;
   bool frontiers_wait_for_intro = false;
   bool references_seen = false;
+  bool in_record_trailer = false;
+  bool keyword_list = false;
+  const size_t page_count = dom.pages.size();
   for (auto& page : dom.pages) {
     if (page.wrapper_page) continue;
-    if (heuristics.rejoin_hyphenation) rejoin_hyphenated_lines(page.lines);
+    keyword_list = false;  // keyword lists never continue across pages
     bool skip_permission_block = false;
     bool drop_ancillary = false;
 
@@ -346,6 +476,22 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           (drop_ancillary || is_post_references_ancillary_start(text))) {
         flush();
         drop_ancillary = true;
+        continue;
+      }
+
+      // Aggregator record trailers ("Subject:", "Publication title:", …) run
+      // to the end of the document once a cluster of record fields begins in
+      // its second half.
+      if (!in_record_trailer && is_record_field_label(text) &&
+          static_cast<size_t>(page.index) * 2 + 1 >= page_count) {
+        int fields = 0;
+        for (size_t j = i; j < page.lines.size() && j < i + 12; ++j) {
+          if (is_record_field_label(page.lines[j].text)) ++fields;
+        }
+        if (fields >= 3) in_record_trailer = true;
+      }
+      if (in_record_trailer) {
+        flush();
         continue;
       }
 
@@ -391,45 +537,67 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           low.find("last 36 months") != std::string::npos) {
         continue;
       }
-      if (is_boilerplate_line(text)) continue;
+      if (is_boilerplate_line(text) || is_provenance_line(text)) continue;
       if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
           is_author_roster_line(text))
         continue;
 
-      // Skip leading title / drop-cap chrome until real body.
+      // Front matter (title block, bylines, affiliations, masthead) precedes
+      // the body anchor found for the whole document; metadata extraction
+      // reads it from the front-matter evidence instead.
       if (!body_started) {
-        if (page.layout_family == LayoutFamily::ScanOcrTwoColumn) {
-          if (low.find("a national survey of practicing psychologists") == 0) {
-            dom.meta.title = text;
-            continue;
-          }
-          if (!dom.meta.title.empty() &&
-              low == "psychotherapy treatment manuals") {
-            dom.meta.title += ": " + text;
-            continue;
-          }
-          if (low.find("there has been considerable debate") == 0) {
-            body_started = true;
-          } else {
-            continue;
-          }
-        }
-        if (body_started) {
-          // Scan front matter established the first body paragraph above.
-        } else if (low == "abstract" || low == "keywords" || low == "1. introduction" ||
-            low.find("1. introduction") == 0) {
-          body_started = true;
-        } else if (looks_like_title_line(text, dom.meta.title)) {
+        const bool at_anchor = static_cast<size_t>(page.index) > anchor.page ||
+                               (static_cast<size_t>(page.index) == anchor.page &&
+                                i >= anchor.line);
+        if (!at_anchor) continue;
+        body_started = true;
+        if (looks_like_title_line(text, dom.meta.title)) {
           auto rest = strip_leading_title_prefix(text, dom.meta.title);
           if (rest.empty() || looks_like_title_line(rest, dom.meta.title)) continue;
           text = rest;
-          body_started = true;
-        } else if (low.find("perseus and other") == 0 || low.find("what explains the") == 0) {
-          body_started = true;
-        } else {
-          // Discard front-matter chrome until a reliable body anchor.
+          low = to_lower(text);
+        }
+      }
+
+      // Abstract / Keywords labels, including letter-spaced, glued
+      // ("Abstract - This…", "Keywords: a; b") and non-English forms.
+      {
+        std::string label, rest;
+        const auto kind = split_front_label(text, label, rest);
+        if (kind == FrontLabel::Abstract || kind == FrontLabel::Keywords) {
+          flush();
+          Block hb;
+          hb.kind = BlockKind::Heading;
+          hb.heading_level =
+              kind == FrontLabel::Keywords && heuristics.keywords_as_h2 ? 2 : 1;
+          hb.text = label;
+          hb.box = line.box;
+          hb.page = page.index;
+          page.blocks.push_back(hb);
+          ++dom.heading_count;
+          keyword_list = kind == FrontLabel::Keywords;
+          if (rest.empty()) continue;
+          text = rest;
+          low = to_lower(text);
+        }
+      }
+      // One-keyword-per-line lists become list items rather than a run-on
+      // paragraph.
+      if (keyword_list) {
+        const bool short_item = split_words(text).size() <= 6 && !ends_sentence_like(text) &&
+                                text.find_first_of(",;") == std::string::npos &&
+                                front_label_of(text) == FrontLabel::None &&
+                                !is_prose_line(text);
+        if (short_item && cur.text.empty()) {
+          Block item;
+          item.kind = BlockKind::ListItem;
+          item.text = text;
+          item.box = line.box;
+          item.page = page.index;
+          page.blocks.push_back(std::move(item));
           continue;
         }
+        keyword_list = false;
       }
 
       if (is_figure_caption(text) && !page.keep_captions) {
@@ -527,7 +695,8 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
 
       std::string glued_heading;
-      auto after = strip_glued_heading(text, glued_heading);
+      auto after = strip_glued_heading(
+          text, glued_heading, page.layout_family == LayoutFamily::MagazineTwoColumn);
       if (!glued_heading.empty()) {
         flush();
         if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
@@ -551,7 +720,8 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         text = after;
       }
 
-      int hl = heading_level_for(text, heuristics);
+      int hl = heading_level_for(text, heuristics,
+                                 page.layout_family == LayoutFamily::MagazineTwoColumn);
       if (hl > 0 && text.size() < 120 && glued_heading.empty()) {
         // Avoid classifying long paragraphs that merely start with a section phrase.
         auto low = to_lower(text);

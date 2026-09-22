@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <map>
 #include <numeric>
+#include <set>
 #include <regex>
 
 namespace agentpdf {
@@ -151,26 +153,146 @@ bool point_in_box(const BBox& box, double x, double y) {
 
 }  // namespace
 
-LayoutFamily detect_layout_family(const std::string& path,
-                                  const std::string& title) {
-  const auto key = to_lower(path + " " + title);
-  if (key.find("ccp_addis2000") != std::string::npos ||
-      key.find("treatment manuals") != std::string::npos) {
-    return LayoutFamily::ScanOcrTwoColumn;
-  }
-  if (key.find("acm_bernstein2002") != std::string::npos ||
-      key.find("storyspace 1") != std::string::npos) {
-    return LayoutFamily::AcmConferenceTwoColumn;
-  }
-  if (key.find("acm_crane2001") != std::string::npos ||
-      key.find("drudgery") != std::string::npos) {
+LayoutFamily detect_layout_family(const LayoutSignals& signals) {
+  // Families are publisher *templates*, recognised by the template's own
+  // printed furniture on the first pages, or (for scans) by page structure.
+  if (signals.scanned_with_text_layer) return LayoutFamily::ScanOcrTwoColumn;
+  auto pages_containing = [&](const char* needle) {
+    int count = 0;
+    for (const auto& text : signals.page_text) {
+      if (text.find(needle) != std::string::npos) ++count;
+    }
+    return count;
+  };
+  // Communications of the ACM prints its masthead in every page footer.
+  if (pages_containing("communications of the acm") >= 2)
     return LayoutFamily::MagazineTwoColumn;
-  }
-  if (key.find("candidate_paper") != std::string::npos ||
-      key.find("african coups") != std::string::npos) {
-    return LayoutFamily::FrontiersRail;
-  }
+  // ACM proceedings carry the ACM permission block on the first article page.
+  if (pages_containing("permission to make digital or hard copies") >= 1)
+    return LayoutFamily::AcmConferenceTwoColumn;
+  // Frontiers journals print frontiersin.org in every page footer.
+  if (pages_containing("frontiersin.org") >= 2) return LayoutFamily::FrontiersRail;
   return LayoutFamily::Generic;
+}
+
+bool is_cover_page(const PageDom& page, const Heuristics& heuristics) {
+  // Repository/download cover sheets prepended to the article (digital
+  // library landing pages, aggregator cover sheets).
+  static const char* cover_markers[] = {
+      "latest updates", "pdf download", "total citations", "total downloads",
+      "citation in bibtex", "this content downloaded from",
+      "see discussions, stats, and author profiles", "terms and conditions of use",
+      "to cite this article", "submit your article to this journal",
+      "view related articles", "view crossmark data", "full terms & conditions",
+  };
+  std::string text;
+  for (const auto& box : page.normalized_boxes) text += to_lower(box.text) + ' ';
+  int markers = 0;
+  for (const char* marker : cover_markers) {
+    if (text.find(marker) != std::string::npos) ++markers;
+  }
+  if (markers >= 2) return true;
+
+  // Pictorial title pages: a text layer exists (so this is not a scan that
+  // needs OCR) but almost no words sit outside the header/footer bands.
+  if (page.normalized_boxes.empty()) return false;
+  const double top = page.height * heuristics.header_band_frac;
+  const double bottom = page.height * (1.0 - heuristics.footer_band_frac);
+  size_t words = 0;
+  for (const auto& box : page.normalized_boxes) {
+    if (box.box.y0 < top || box.box.y1 > bottom) continue;
+    for (const auto& word : split_words(box.text)) {
+      if (!is_digits(word)) ++words;
+    }
+  }
+  return words < 12;
+}
+
+void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& heuristics) {
+  // Running heads/feet repeat across pages with only numbers changing. Any
+  // header/footer-band line whose digit-normalised text recurs on several
+  // pages is chrome, whatever the publisher prints there.
+  if (!heuristics.strip_running_headers) return;
+  size_t content_pages = 0;
+  for (const auto& page : pages) {
+    if (!page.wrapper_page && !page.normalized_boxes.empty()) ++content_pages;
+  }
+  if (content_pages < 2) return;
+
+  struct BandLine {
+    std::string signature;
+    std::vector<size_t> boxes;
+    bool top = false;
+  };
+  auto signature_of = [](const std::string& text) {
+    std::string out;
+    bool in_digits = false;
+    for (unsigned char c : to_lower(text)) {
+      if (std::isdigit(c)) {
+        if (!in_digits) out.push_back('#');
+        in_digits = true;
+        continue;
+      }
+      in_digits = false;
+      out.push_back(static_cast<char>(c));
+    }
+    return collapse_ws(out);
+  };
+
+  std::vector<std::vector<BandLine>> page_lines(pages.size());
+  std::map<std::string, size_t> page_counts;
+  for (size_t pi = 0; pi < pages.size(); ++pi) {
+    const auto& page = pages[pi];
+    if (page.wrapper_page || page.height <= 0) continue;
+    // Detection band is 1.5x the stripping band: running heads sit just
+    // inside or just below it depending on the template, and requiring
+    // cross-page repetition keeps the wider band safe for body text.
+    const double top = page.height * heuristics.header_band_frac * 1.5;
+    const double bottom = page.height * (1.0 - heuristics.footer_band_frac * 1.5);
+    std::vector<size_t> band;
+    for (size_t bi = 0; bi < page.normalized_boxes.size(); ++bi) {
+      const auto& box = page.normalized_boxes[bi].box;
+      if (box.y1 <= top || box.y0 >= bottom) band.push_back(bi);
+    }
+    std::sort(band.begin(), band.end(), [&](size_t a, size_t b) {
+      const auto& ba = page.normalized_boxes[a].box;
+      const auto& bb = page.normalized_boxes[b].box;
+      if (std::abs(ba.y0 - bb.y0) > 2.5) return ba.y0 < bb.y0;
+      return ba.x0 < bb.x0;
+    });
+    auto& lines = page_lines[pi];
+    double line_y = -1e9;
+    for (size_t bi : band) {
+      const auto& box = page.normalized_boxes[bi];
+      const bool is_top = box.box.y1 <= top;
+      if (lines.empty() || std::abs(box.box.y0 - line_y) > 2.5 || lines.back().top != is_top) {
+        lines.push_back({{}, {}, is_top});
+        line_y = box.box.y0;
+      }
+      lines.back().boxes.push_back(bi);
+    }
+    std::set<std::string> seen_here;
+    for (auto& line : lines) {
+      std::string text;
+      for (size_t bi : line.boxes) text += page.normalized_boxes[bi].text + ' ';
+      line.signature = signature_of(text);
+      if (!line.signature.empty() && seen_here.insert(line.signature).second)
+        ++page_counts[line.signature];
+    }
+  }
+
+  const size_t needed = std::max<size_t>(
+      2, static_cast<size_t>(std::ceil(static_cast<double>(content_pages) * 0.3)));
+  for (size_t pi = 0; pi < pages.size(); ++pi) {
+    for (const auto& line : page_lines[pi]) {
+      if (line.signature.empty() || page_counts[line.signature] < needed) continue;
+      for (size_t bi : line.boxes) {
+        auto& box = pages[pi].normalized_boxes[bi];
+        if (box.region == RegionKind::Body)
+          box.region = line.top ? RegionKind::Header : RegionKind::Footer;
+      }
+    }
+  }
 }
 
 double score_text_quality(const std::vector<NormalizedTextBox>& boxes) {
@@ -569,7 +691,10 @@ std::vector<TextLine> linearize_page(const PageDom& page,
   if (body.empty()) return {};
 
   std::optional<double> cut;
-  if (page.layout_family == LayoutFamily::MagazineTwoColumn ||
+  // Column detection is geometric (a vertical whitespace strip), so it applies
+  // to unknown templates as well as the named families.
+  if (page.layout_family == LayoutFamily::Generic ||
+      page.layout_family == LayoutFamily::MagazineTwoColumn ||
       page.layout_family == LayoutFamily::AcmConferenceTwoColumn ||
       page.layout_family == LayoutFamily::ScanOcrTwoColumn ||
       (page.layout_family == LayoutFamily::FrontiersRail && page.index >= 2)) {

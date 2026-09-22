@@ -4,6 +4,7 @@
 #include "agentpdf/util.hpp"
 
 #include <poppler-document.h>
+#include <poppler-font.h>
 #include <poppler-image.h>
 #include <poppler-page-renderer.h>
 #include <poppler-page.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -44,6 +46,10 @@ bool is_running_header_footer(const std::string& text, const Heuristics& h) {
   auto low = to_lower(t);
   if (t.empty()) return true;
   if (h.strip_page_numbers && is_mostly_digits(t) && t.size() <= 3) return true;
+  if (h.strip_page_numbers) {
+    static const std::regex page_of(R"(^page\s+\d+(\s+of\s+\d+)?$)");
+    if (std::regex_match(low, page_of)) return true;
+  }
   if (low.find("communications of the acm") != std::string::npos) return true;
   if (low.find("vol.") != std::string::npos &&
       (low.find("no.") != std::string::npos || low.find("/vol.") != std::string::npos))
@@ -241,7 +247,8 @@ int score_lines(const std::vector<TextLine>& lines) {
   return score;
 }
 
-std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heuristics& h) {
+std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heuristics& h,
+                                         bool magazine_end_marks) {
   std::vector<TextLine> out;
   out.reserve(lines.size());
   for (auto& ln : lines) {
@@ -253,8 +260,10 @@ std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heu
         low = to_lower(ln.text);
       }
     }
-    // Drop a trailing single-letter ornament (e.g. magazine end mark "c").
-    if (ln.text.size() >= 3) {
+    // Drop a trailing single-letter ornament (the Communications of the ACM
+    // end mark "c"). Elsewhere a final single letter is text ("Appendix B",
+    // letter-spaced labels such as "A B S T R A C T").
+    if (magazine_end_marks && ln.text.size() >= 3) {
       const auto last = ln.text.back();
       const auto prev = ln.text[ln.text.size() - 2];
       if (std::isspace(static_cast<unsigned char>(prev)) &&
@@ -325,9 +334,14 @@ std::vector<RawBox> collect_raw_boxes(poppler::page& page) {
   return raw;
 }
 
-std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page) {
+std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
+                                                       bool include_font = false) {
   std::vector<NormalizedTextBox> result;
-  auto boxes = page.text_list();
+  // Body classification deliberately runs without font sizes (its dormant
+  // small-font footnote rule would quarantine text without endnote
+  // conversion); only front-matter evidence requests them.
+  auto boxes = include_font ? page.text_list(poppler::page::text_list_include_font)
+                            : page.text_list();
   result.reserve(boxes.size());
   for (const auto& source : boxes) {
     NormalizedTextBox box;
@@ -337,10 +351,76 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page) {
     box.box = BBox{rect.x(), rect.y(), rect.x() + rect.width(),
                    rect.y() + rect.height()};
     box.rotation = source.rotation();
-    if (source.has_font_info()) box.font_size = source.get_font_size();
+    if (source.has_font_info()) {
+      box.font_size = source.get_font_size();
+      const auto font = to_lower(source.get_font_name());
+      for (const char* weight : {"bold", "black", "heavy", "semibold", "demi"}) {
+        if (font.find(weight) != std::string::npos) box.bold = true;
+      }
+    }
     result.push_back(std::move(box));
   }
   return result;
+}
+
+// A scanned page carries a page-covering raster image. Rendered on white and
+// on black paper it yields (nearly) identical pixels everywhere, because no
+// paper shows through; a vector page differs wherever paper is visible.
+double page_image_coverage(poppler::page& page) {
+  poppler::page_renderer on_white;
+  poppler::page_renderer on_black;
+  on_white.set_paper_color(0xffffffff);
+  on_black.set_paper_color(0xff000000);
+  on_white.set_image_format(poppler::image::format_argb32);
+  on_black.set_image_format(poppler::image::format_argb32);
+  constexpr double dpi = 24.0;
+  const auto a = on_white.render_page(&page, dpi, dpi);
+  const auto b = on_black.render_page(&page, dpi, dpi);
+  if (!a.is_valid() || !b.is_valid() || a.width() != b.width() ||
+      a.height() != b.height() || a.width() <= 0 || a.height() <= 0) {
+    return 0.0;
+  }
+  const auto* pa = reinterpret_cast<const unsigned char*>(a.const_data());
+  const auto* pb = reinterpret_cast<const unsigned char*>(b.const_data());
+  size_t covered = 0;
+  for (int y = 0; y < a.height(); ++y) {
+    const auto* ra = pa + static_cast<size_t>(y) * static_cast<size_t>(a.bytes_per_row());
+    const auto* rb = pb + static_cast<size_t>(y) * static_cast<size_t>(b.bytes_per_row());
+    for (int x = 0; x < a.width(); ++x) {
+      const auto* ca = ra + x * 4;
+      const auto* cb = rb + x * 4;
+      if (std::abs(ca[0] - cb[0]) + std::abs(ca[1] - cb[1]) + std::abs(ca[2] - cb[2]) < 24)
+        ++covered;
+    }
+  }
+  return static_cast<double>(covered) /
+         (static_cast<double>(a.width()) * static_cast<double>(a.height()));
+}
+
+// Scanned-with-text-layer PDFs: every sampled page is covered by an image,
+// and the (invisible) text layer uses non-embedded fonts. A painted vector
+// background alone does not qualify, because its visible text is embedded.
+bool detect_scanned_text_layer(poppler::document& doc, int sample_pages) {
+  std::vector<std::string> non_embedded;
+  for (const auto& font : doc.fonts()) {
+    if (!font.is_embedded()) non_embedded.push_back(font.name());
+  }
+  if (non_embedded.empty()) return false;
+  size_t chars = 0;
+  size_t non_embedded_chars = 0;
+  for (int pi = 0; pi < sample_pages; ++pi) {
+    std::unique_ptr<poppler::page> page(doc.create_page(pi));
+    if (!page) return false;
+    if (page_image_coverage(*page) < 0.90) return false;
+    for (const auto& tb : page->text_list(poppler::page::text_list_include_font)) {
+      const auto len = tb.text().size();
+      chars += len;
+      if (std::find(non_embedded.begin(), non_embedded.end(), tb.get_font_name()) !=
+          non_embedded.end())
+        non_embedded_chars += len;
+    }
+  }
+  return chars > 0 && static_cast<double>(non_embedded_chars) / static_cast<double>(chars) >= 0.60;
 }
 
 double line_stream_quality(const std::vector<TextLine>& lines) {
@@ -369,30 +449,11 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     return result;
   }
 
-  auto title = ustring_to_utf8(doc->get_title());
-  auto author = ustring_to_utf8(doc->get_author());
-  if (!title.empty()) result.dom.meta.title = collapse_ws(title);
-  if (!author.empty()) {
-    size_t start = 0;
-    while (start < author.size()) {
-      size_t pos = author.find_first_of(";,", start);
-      if (pos == std::string::npos) pos = author.size();
-      auto part = trim(author.substr(start, pos - start));
-      if (part.find(" and ") != std::string::npos) {
-        size_t a = 0;
-        while (a < part.size()) {
-          size_t p = part.find(" and ", a);
-          if (p == std::string::npos) p = part.size();
-          auto sub = trim(part.substr(a, p - a));
-          if (!sub.empty()) result.dom.meta.authors.push_back(sub);
-          a = (p == part.size()) ? p : p + 5;
-        }
-      } else if (!part.empty()) {
-        result.dom.meta.authors.push_back(part);
-      }
-      start = pos + 1;
-    }
-  }
+  // Info-dictionary strings are kept as raw evidence; metadata extraction
+  // validates them against the text layer (many are junk: temp filenames,
+  // manuscript IDs, uploader account names).
+  result.dom.info_title = collapse_ws(ustring_to_utf8(doc->get_title()));
+  result.dom.info_author = collapse_ws(ustring_to_utf8(doc->get_author()));
 
   const int n = doc->pages();
   if (n <= 0) {
@@ -400,25 +461,40 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     return result;
   }
 
-  const LayoutFamily family = detect_layout_family(path, result.dom.meta.title);
-  bool references_active = false;
-  std::vector<OcrJob> ocr_jobs;
-  ocr_jobs.reserve(n);
-
+  // Pass 1: geometry of every page, plus font-bearing front-matter evidence.
+  constexpr int front_pages = 3;
+  LayoutSignals signals;
+  auto& pages = result.dom.pages;
+  pages.reserve(static_cast<size_t>(n));
   for (int pi = 0; pi < n; ++pi) {
     std::unique_ptr<poppler::page> page(doc->create_page(pi));
-    if (!page) continue;
     PageDom pd;
     pd.index = pi;
-    auto rect = page->page_rect();
-    pd.width = rect.width();
-    pd.height = rect.height();
-    pd.layout_family = family;
-    pd.wrapper_page =
-        (family == LayoutFamily::AcmConferenceTwoColumn && pi == 0) ||
-        (family == LayoutFamily::MagazineTwoColumn && pi == 0);
+    if (page) {
+      auto rect = page->page_rect();
+      pd.width = rect.width();
+      pd.height = rect.height();
+      pd.normalized_boxes = collect_normalized_boxes(*page);
+      if (pi < front_pages) {
+        result.dom.front_boxes.push_back(collect_normalized_boxes(*page, true));
+        std::string text;
+        for (const auto& box : pd.normalized_boxes) text += box.text + ' ';
+        signals.page_text.push_back(to_lower(text));
+      }
+    }
+    pages.push_back(std::move(pd));
+  }
+  signals.scanned_with_text_layer =
+      detect_scanned_text_layer(*doc, std::min(n, front_pages));
 
-    pd.normalized_boxes = collect_normalized_boxes(*page);
+  // Pass 2: layout family and cover pages from content, never from names.
+  const LayoutFamily family = detect_layout_family(signals);
+  for (auto& pd : pages) pd.layout_family = family;
+  if (n > 1) pages.front().wrapper_page = is_cover_page(pages.front(), heuristics);
+
+  // Pass 3: region classification, then cross-page running-header detection.
+  bool references_active = false;
+  for (auto& pd : pages) {
     classify_page_regions(pd, heuristics);
     for (const auto& box : pd.normalized_boxes) {
       auto low = to_lower(trim(box.text));
@@ -429,10 +505,17 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
       }
     }
     if (references_active) mark_post_references_ancillary(pd, true);
-    if (pd.wrapper_page) {
-      result.dom.pages.push_back(std::move(pd));
-      continue;
-    }
+  }
+  mark_repeated_page_chrome(pages, heuristics);
+
+  // Pass 4: choose and normalize each page's line stream.
+  std::vector<OcrJob> ocr_jobs;
+  ocr_jobs.reserve(n);
+  for (int pi = 0; pi < n; ++pi) {
+    PageDom& pd = pages[static_cast<size_t>(pi)];
+    if (pd.wrapper_page) continue;
+    std::unique_ptr<poppler::page> page(doc->create_page(pi));
+    if (!page) continue;
 
     auto raw = collect_raw_boxes(*page);
     size_t char_count = 0;
@@ -440,12 +523,12 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
 
     if (static_cast<double>(char_count) < heuristics.min_text_layer_chars_per_page) {
       ocr_jobs.push_back({pi, false});
-      result.dom.pages.push_back(std::move(pd));
       continue;
     }
 
+    const bool magazine = family == LayoutFamily::MagazineTwoColumn;
     auto geometry_lines =
-        filter_chrome_lines(linearize_page(pd, heuristics), heuristics);
+        filter_chrome_lines(linearize_page(pd, heuristics), heuristics, magazine);
     std::string flow_text;
     std::string raw_text;
     try {
@@ -458,9 +541,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
       raw_text.clear();
     }
     auto flow_lines =
-        filter_chrome_lines(lines_from_reading_order_text(flow_text), heuristics);
+        filter_chrome_lines(lines_from_reading_order_text(flow_text), heuristics, magazine);
     auto raw_lines =
-        filter_chrome_lines(lines_from_reading_order_text(raw_text), heuristics);
+        filter_chrome_lines(lines_from_reading_order_text(raw_text), heuristics, magazine);
     flow_lines =
         quarantine_stream_lines(pd, std::move(flow_lines), heuristics);
     raw_lines = quarantine_stream_lines(pd, std::move(raw_lines), heuristics);
@@ -494,10 +577,14 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
                                       : std::move(geometry_lines);
         break;
       case LayoutFamily::Generic:
-        pd.lines = line_stream_quality(flow_lines) >=
-                           line_stream_quality(geometry_lines)
-                       ? std::move(flow_lines)
-                       : std::move(geometry_lines);
+        // Poppler's reading-order stream handles multi-column layouts for
+        // unknown templates; geometry wins only when clearly cleaner, since
+        // near-ties are noise in the quality score.
+        pd.lines = flow_lines.empty() ||
+                           line_stream_quality(geometry_lines) >
+                               line_stream_quality(flow_lines) + 0.05
+                       ? std::move(geometry_lines)
+                       : std::move(flow_lines);
         break;
     }
 
@@ -505,8 +592,6 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
         heuristics.ocr_when_scan_present) {
       ocr_jobs.push_back({pi, true});
     }
-
-    result.dom.pages.push_back(std::move(pd));
   }
 
   // Run all collected OCR work in parallel using the configured worker count.

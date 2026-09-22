@@ -35,6 +35,7 @@ set(AGENTPDF_SOURCES
   src/text/paragraphs.cpp
   src/text/footnotes.cpp
   src/text/structure.cpp
+  src/text/frontmatter.cpp
   src/meta/extract.cpp
   src/markdown/assemble.cpp
   src/pipeline/convert.cpp

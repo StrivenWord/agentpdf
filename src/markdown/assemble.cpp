@@ -1,3 +1,4 @@
+#include "agentpdf/frontmatter.hpp"
 #include "agentpdf/pdf.hpp"
 #include "agentpdf/util.hpp"
 
@@ -120,16 +121,22 @@ std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristi
 
   std::ostringstream body;
   bool seen_refs = false;
+  bool in_list = false;
   for (const auto& page : dom.pages) {
     for (const auto& b : page.blocks) {
       if (heuristics.dedupe_title_from_body && is_title_duplicate(b.text, dom.meta.title)) {
         continue;
       }
+      // A list must be closed by a blank line, or the next paragraph would
+      // read as a lazy continuation of the last item.
+      if (in_list && b.kind != BlockKind::ListItem) body << "\n";
+      in_list = b.kind == BlockKind::ListItem;
       if (b.kind == BlockKind::Heading) {
         int level = b.heading_level;
         auto low = to_lower(b.text);
-        if (heuristics.abstract_as_h1 && low == "abstract") level = 1;
-        if (heuristics.keywords_as_h2 && (low == "keywords" || low == "key words")) level = 2;
+        const auto label = front_label_of(b.text);
+        if (heuristics.abstract_as_h1 && label == FrontLabel::Abstract) level = 1;
+        if (heuristics.keywords_as_h2 && label == FrontLabel::Keywords) level = 2;
         if (low == "references") seen_refs = true;
         body << heading_prefix(level) << fix_missing_compound_hyphens(b.text) << "\n\n";
       } else if (b.kind == BlockKind::Table) {

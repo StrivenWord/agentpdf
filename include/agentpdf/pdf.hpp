@@ -19,7 +19,17 @@ struct ExtractResult {
 
 ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heuristics);
 
-LayoutFamily detect_layout_family(const std::string& path, const std::string& title);
+// Content signals for layout-family detection (first pages only).
+struct LayoutSignals {
+  std::vector<std::string> page_text;  // lowercase text of the first pages
+  bool scanned_with_text_layer = false;
+};
+
+LayoutFamily detect_layout_family(const LayoutSignals& signals);
+// Repository cover sheets and pictorial title pages carry no article body.
+bool is_cover_page(const PageDom& page, const Heuristics& heuristics);
+// Mark header/footer-band lines that recur across pages as chrome.
+void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& heuristics);
 double score_text_quality(const std::vector<NormalizedTextBox>& boxes);
 void classify_page_regions(PageDom& page, const Heuristics& heuristics);
 // After a References section, quarantine full-width / form-like back matter
@@ -39,6 +49,9 @@ bool rasterize_page_raw(const std::string& path, int page_index, int dpi,
 void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics);
 void rejoin_hyphenated_lines(std::vector<TextLine>& lines);
 void isolate_footnotes(DocumentDom& dom, const Heuristics& heuristics);
+// Title, authors and DOI from front-matter evidence; runs before block
+// building because body assembly needs the title.
+void extract_front_matter_metadata(DocumentDom& dom);
 void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& spec);
 std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristics);
 void write_run_stats(const DocumentDom& dom, const JobEntry& job, const std::string& report_dir);

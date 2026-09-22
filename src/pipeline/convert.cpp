@@ -14,6 +14,9 @@ bool convert_document(const JobEntry& job, const Heuristics& heuristics,
     return false;
   }
   DocumentDom& dom = extracted.dom;
+  // Title/authors/DOI come from front-matter evidence first: body assembly
+  // needs the title to recognise and drop the printed title block.
+  extract_front_matter_metadata(dom);
   build_blocks_from_lines(dom, heuristics);
   isolate_footnotes(dom, heuristics);
   extract_and_validate_metadata(dom, meta_spec);
