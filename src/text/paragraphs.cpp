@@ -612,7 +612,13 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         cur.box = line.box;
         cur.page = page.index;
       } else {
-        if (!cur.text.empty() && cur.text.back() != '-' && !text.empty()) {
+        // Join without space only for soft hyphens at end of line.
+        if (!cur.text.empty() && cur.text.back() == '-' && !text.empty() &&
+            std::islower(static_cast<unsigned char>(text.front()))) {
+          // Soft hyphen continuation: remove hyphen and join directly.
+          cur.text.pop_back();
+        } else if (!cur.text.empty() && !text.empty()) {
+          // Normal case: add space between text.
           cur.text.push_back(' ');
         }
         cur.text += text;
@@ -629,8 +635,9 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
   // does not look like a finished sentence (typical mid-word page wraps).
   auto append_paragraph = [](Block& dst, const Block& src) {
     if (src.text.empty()) return;
-    if (!dst.text.empty() && dst.text.back() == '-') {
-      // Soft hyphen across a page/column break: drop the hyphen and glue.
+    if (!dst.text.empty() && dst.text.back() == '-' && !src.text.empty() &&
+        std::islower(static_cast<unsigned char>(src.text.front()))) {
+      // Soft hyphen across a page/column break: only drop if next starts lowercase.
       dst.text.pop_back();
       dst.text += src.text;
     } else {

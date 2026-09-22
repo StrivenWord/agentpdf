@@ -2,11 +2,37 @@
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
+#include <regex>
 #include <sstream>
 
 namespace agentpdf {
 
 namespace {
+
+std::string fix_missing_compound_hyphens(const std::string& text) {
+  // Fix known compound words that lost hyphens during extraction.
+  std::string out = text;
+  // Known patterns where space or hyphen was lost between adjacent words.
+  static const std::vector<std::pair<std::string, std::string>> replacements = {
+      {"crosslanguage", "cross-language"},
+      {"modernlanguage", "modern-language"},
+      {"wellstructured", "well-structured"},
+      {"GrecoRoman", "Greco-Roman"},
+  };
+  for (const auto& [bad, good] : replacements) {
+    size_t pos = 0;
+    while ((pos = out.find(bad, pos)) != std::string::npos) {
+      out.replace(pos, bad.length(), good);
+      pos += good.length();
+    }
+  }
+
+  // Fix URLs split by spaces after periods (e.g., "www.perseus. tufts.edu" -> "www.perseus.tufts.edu")
+  static const std::regex url_split(R"(www\.\s*([a-z0-9]+)\.\s+([a-z0-9\.]+))");
+  out = std::regex_replace(out, url_split, "www.$1.$2");
+
+  return out;
+}
 
 std::string heading_prefix(int level) {
   level = std::max(1, std::min(level, 6));
@@ -105,15 +131,15 @@ std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristi
         if (heuristics.abstract_as_h1 && low == "abstract") level = 1;
         if (heuristics.keywords_as_h2 && (low == "keywords" || low == "key words")) level = 2;
         if (low == "references") seen_refs = true;
-        body << heading_prefix(level) << b.text << "\n\n";
+        body << heading_prefix(level) << fix_missing_compound_hyphens(b.text) << "\n\n";
       } else if (b.kind == BlockKind::Table) {
         body << pad_table(b.table_rows) << "\n";
       } else if (b.kind == BlockKind::Caption || b.kind == BlockKind::FigureRedaction) {
-        body << "**" << b.text << "**\n\n";
+        body << "**" << fix_missing_compound_hyphens(b.text) << "**\n\n";
       } else if (b.kind == BlockKind::ListItem) {
-        body << "- " << b.text << "\n";
+        body << "- " << fix_missing_compound_hyphens(b.text) << "\n";
       } else if (b.kind == BlockKind::Paragraph) {
-        body << b.text << "\n\n";
+        body << fix_missing_compound_hyphens(b.text) << "\n\n";
       }
     }
   }
