@@ -283,6 +283,8 @@ struct OcrPageResult {
   int page_index = -1;
   std::vector<TextLine> lines;
   bool used_ocr = false;
+  double skew_deg = 0.0;
+  std::vector<BBox> content_regions;
 };
 
 OcrPageResult run_ocr_job(const std::string& path, int page_index, const Heuristics& heuristics) {
@@ -292,9 +294,11 @@ OcrPageResult run_ocr_job(const std::string& path, int page_index, const Heurist
   int w = 0, h = 0, bpr = 0;
   std::string err;
   if (!rasterize_page_raw(path, page_index, heuristics.ocr_dpi, raw, w, h, bpr, err)) return res;
-  double skew = 0;
-  std::vector<BBox> regions;
-  leptonica_analyze_raw(raw.data(), w, h, bpr, skew, regions, err);
+
+  // Analyze page geometry with Leptonica: detect skew and content regions.
+  leptonica_analyze_raw(raw.data(), w, h, bpr, res.skew_deg, res.content_regions, err);
+
+  // Run OCR on the page (Leptonica analysis results can inform OCR quality).
   std::vector<TextLine> ocr_lines;
   if (tesseract_ocr_page_thread_local(raw.data(), w, h, bpr, heuristics, ocr_lines, err)) {
     res.lines = std::move(ocr_lines);
@@ -526,6 +530,11 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
       const auto& res = ocr_results[job.page_index];
       if (res.page_index < 0 || res.lines.empty()) continue;
       auto& page = result.dom.pages[job.page_index];
+
+      // Store Leptonica analysis results (skew detection and content regions).
+      page.detected_skew_deg = res.skew_deg;
+      page.ocr_content_regions = res.content_regions;
+
       if (job.candidate) {
         if (line_stream_quality(res.lines) > line_stream_quality(page.lines) + 0.04) {
           page.lines = quarantine_stream_lines(page, std::move(res.lines), heuristics);

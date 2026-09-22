@@ -164,7 +164,9 @@ struct PageDom {
   bool has_region_overrides = false;
   LayoutFamily layout_family = LayoutFamily::Generic;
   double text_quality = 1.0;
+  double detected_skew_deg = 0.0;  // Detected skew from Leptonica analysis (OCR pages only)
   std::optional<double> column_cut_override;
+  std::vector<BBox> ocr_content_regions;  // Content bounding boxes from Leptonica
   std::vector<NormalizedTextBox> normalized_boxes;
   std::vector<TextLine> lines;
   std::vector<Block> blocks;
