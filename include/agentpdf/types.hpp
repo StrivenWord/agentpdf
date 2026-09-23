@@ -195,8 +195,8 @@ struct Block {
   BBox box;
   int column = 0;
   int page = 0;
-  // Opens a numbered bibliography entry: never joined to the paragraph
-  // before it, however that one ends.
+  // Opens a numbered bibliography entry or list item: never joined to the
+  // paragraph before it, however that one ends.
   bool entry_start = false;
   std::vector<std::vector<std::string>> table_rows;
 };

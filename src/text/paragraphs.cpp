@@ -327,6 +327,18 @@ bool is_bibliography_entry_start(const std::string& text) {
   return std::regex_search(text, entry);
 }
 
+// The first line of a numbered list item ("1. Initialize population…",
+// "2. Japan Life Insurers…"), unless the text before it runs on into the
+// number: "…as shown in Table" + "2. The results…" is one sentence.
+bool is_list_item_start(const std::string& text, const std::string& before) {
+  static const std::regex item(R"(^\d{1,2}\.\s+["A-Z\xC0-\xFF])");
+  if (!std::regex_search(text, item)) return false;
+  static const std::regex runs_on(
+      R"((?:^|\s)(?:table|figure|fig\.|section|sections|equation|eq\.|chapter|step|page|pp?\.|no\.|vol\.|and|or|to|of|in|at|by|than|from|with)$)",
+      std::regex::icase);
+  return !std::regex_search(trim(before), runs_on);
+}
+
 // A short line set in capitals ("RESULTS", "DATA AVAILABILITY"), not an
 // acronym-laden equation or table fragment ("PES,c", "Load/MW", "12 GB").
 bool capitals_line_ok(const std::string& text) {
@@ -946,8 +958,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         continue;
       }
 
-      // Numbered bibliography entries each open a paragraph.
-      if (references_seen && is_bibliography_entry_start(text)) {
+      // Numbered bibliography entries and list items each open a paragraph
+      // (Markdown reads a run of them as an ordered list).
+      if ((references_seen && is_bibliography_entry_start(text)) ||
+          is_list_item_start(text, cur.text)) {
         flush();
         cur.kind = BlockKind::Paragraph;
         cur.text = text;
