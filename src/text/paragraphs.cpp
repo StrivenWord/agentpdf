@@ -925,8 +925,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           hb.page = page.index;
           page.blocks.push_back(hb);
           ++dom.heading_count;
-          if (low == "references" || low == "bibliography" ||
-              low == "works cited") {
+          // Numbered too: "14. REFERENCES".
+          static const std::regex section_number(R"(^\d{1,2}(?:\.\d{1,2})*\.?\s+)");
+          const auto name = std::regex_replace(low, section_number, "");
+          if (name == "references" || name == "bibliography" || name == "works cited") {
             references_seen = true;
           }
           continue;
