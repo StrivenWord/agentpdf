@@ -1,3 +1,4 @@
+#include "agentpdf/frontmatter.hpp"
 #include "agentpdf/pdf.hpp"
 #include "agentpdf/util.hpp"
 
@@ -116,6 +117,29 @@ void append_box_text(std::string& line, const std::string& value) {
   line += value;
 }
 
+// Erase the run of `text` whose alphanumerics fold to `key`, when that run
+// covers whole words; spacing and punctuation inside it do not matter.
+bool erase_folded_words(std::string& text, const std::string& key) {
+  auto word_char = [](unsigned char c) { return std::isalnum(c) || c >= 0x80; };
+  std::string folded;
+  std::vector<size_t> at;
+  for (size_t i = 0; i < text.size(); ++i) {
+    const auto c = static_cast<unsigned char>(text[i]);
+    if (!word_char(c)) continue;
+    folded.push_back(static_cast<char>(std::isalnum(c) ? std::tolower(c) : c));
+    at.push_back(i);
+  }
+  for (size_t pos = folded.find(key); pos != std::string::npos; pos = folded.find(key, pos + 1)) {
+    const size_t begin = at[pos];
+    const size_t end = at[pos + key.size() - 1] + 1;
+    if (begin > 0 && word_char(static_cast<unsigned char>(text[begin - 1]))) continue;
+    if (end < text.size() && word_char(static_cast<unsigned char>(text[end]))) continue;
+    text = collapse_ws(text.erase(begin, end - begin));
+    return true;
+  }
+  return false;
+}
+
 const PageOverride* find_page_override(const Heuristics& heuristics, int page) {
   for (const auto& override_entry : heuristics.page_overrides) {
     if (override_entry.page == page) return &override_entry;
@@ -208,21 +232,39 @@ bool is_cover_page(const PageDom& page, const Heuristics& heuristics) {
   return words < 12;
 }
 
+namespace {
+
+// A page folio: an issue date ("AUGUST 2026"), optionally with the
+// publication's name and the page number ("BEST'S REVIEW • AUGUST 2026 67").
+// No sentence reads like that, so a band line of this shape is chrome even
+// on a document too short for its running heads to repeat.
+bool is_folio_line(const std::string& text) {
+  static const std::regex month_year(
+      R"(\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\.?\s+(?:19|20)\d{2}\b)",
+      std::regex::icase);
+  if (!std::regex_search(text, month_year)) return false;
+  return split_words(text).size() <= 10 && lowercase_word_share(text) < 0.3;
+}
+
+}  // namespace
+
 void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& heuristics) {
   // Running heads/feet repeat across pages with only numbers changing. Any
   // header/footer-band line whose digit-normalised text recurs on several
-  // pages is chrome, whatever the publisher prints there.
+  // pages is chrome, whatever the publisher prints there; so is a folio line
+  // in the stripping band, repeated or not.
   if (!heuristics.strip_running_headers) return;
   size_t content_pages = 0;
   for (const auto& page : pages) {
     if (!page.wrapper_page && !page.normalized_boxes.empty()) ++content_pages;
   }
-  if (content_pages < 2) return;
+  if (content_pages == 0) return;
 
   struct BandLine {
     std::string signature;
     std::vector<size_t> boxes;
     bool top = false;
+    bool folio = false;
   };
   auto signature_of = [](const std::string& text) {
     std::string out;
@@ -271,11 +313,19 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
       }
       lines.back().boxes.push_back(bi);
     }
+    const double strip_top = page.height * heuristics.header_band_frac;
+    const double strip_bottom = page.height * (1.0 - heuristics.footer_band_frac);
     std::set<std::string> seen_here;
     for (auto& line : lines) {
       std::string text;
-      for (size_t bi : line.boxes) text += page.normalized_boxes[bi].text + ' ';
+      bool in_strip_band = true;
+      for (size_t bi : line.boxes) {
+        const auto& box = page.normalized_boxes[bi];
+        text += box.text + ' ';
+        if (line.top ? box.box.y1 > strip_top : box.box.y0 < strip_bottom) in_strip_band = false;
+      }
       line.signature = signature_of(text);
+      line.folio = in_strip_band && is_folio_line(text);
       if (!line.signature.empty() && seen_here.insert(line.signature).second)
         ++page_counts[line.signature];
     }
@@ -285,7 +335,9 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
       2, static_cast<size_t>(std::ceil(static_cast<double>(content_pages) * 0.3)));
   for (size_t pi = 0; pi < pages.size(); ++pi) {
     for (const auto& line : page_lines[pi]) {
-      if (line.signature.empty() || page_counts[line.signature] < needed) continue;
+      if (line.signature.empty()) continue;
+      const bool repeated = content_pages >= 2 && page_counts[line.signature] >= needed;
+      if (!repeated && !line.folio) continue;
       for (size_t bi : line.boxes) {
         auto& box = pages[pi].normalized_boxes[bi];
         if (box.region == RegionKind::Body)
@@ -360,6 +412,14 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     const bool at_column_start =
         x_fraction < 0.15 || std::abs(x_fraction - 0.53) < 0.055;
     if (!at_column_start) continue;
+    // A footnote key starts its line; a digit set right after a word on the
+    // same row is a superscript citation in the body text ("…centers.12").
+    const bool follows_word = std::any_of(
+        page.normalized_boxes.begin(), page.normalized_boxes.end(), [&](const auto& other) {
+          return &other != &box && other.box.y0 < box.box.y1 && other.box.y1 > box.box.y0 &&
+                 other.box.x1 <= box.box.x0 + 0.5 && other.box.x1 >= box.box.x0 - 6.0;
+        });
+    if (follows_word) continue;
     auto& start = box.box.cx() < page.width * 0.5 ? footnote_start_left
                                                   : footnote_start_right;
     start = std::min(start, box.box.y0);
@@ -779,6 +839,9 @@ std::vector<TextLine> quarantine_stream_lines(
   struct QuarantineLine {
     std::string text;
     RegionKind region;
+    std::string folded{};       // fold_alnum(text)
+    std::string prefix{};       // first four words, when it has four
+    bool figure_reference = false;  // "figure 3"
   };
   std::vector<QuarantineLine> visual_lines;
   std::string current;
@@ -802,6 +865,19 @@ std::vector<TextLine> quarantine_stream_lines(
   if (!current.empty())
     visual_lines.push_back(
         {to_lower(collapse_ws(current)), current_region});
+  static const std::regex figure_reference_line(R"(^\s*figure\s+\d+[a-z]?[\.,]?\s*$)",
+                                                std::regex::icase);
+  static const std::regex figure_reference_visual(R"(^figure\s+\d+[a-z]?[\.,]?$)",
+                                                  std::regex::icase);
+  static const std::regex year_range(R"(^\s*20\d{2}\s*[-–]\s*20\d{2}\s*$)");
+  for (auto& visual_line : visual_lines) {
+    visual_line.folded = fold_alnum(visual_line.text);
+    const auto tokens = split_words(visual_line.text);
+    if (tokens.size() >= 4)
+      visual_line.prefix = tokens[0] + " " + tokens[1] + " " + tokens[2] + " " + tokens[3];
+    visual_line.figure_reference =
+        std::regex_match(visual_line.text, figure_reference_visual);
+  }
 
   std::vector<TextLine> kept;
   for (auto line : lines) {
@@ -810,24 +886,28 @@ std::vector<TextLine> quarantine_stream_lines(
     bool remove = low.empty();
     const bool protected_reference =
         page.layout_family == LayoutFamily::FrontiersRail &&
-        std::regex_match(
-            line.text,
-            std::regex(R"(^\s*figure\s+\d+[a-z]?[\.,]?\s*$)",
-                       std::regex::icase)) &&
-        !kept.empty() &&
+        std::regex_match(line.text, figure_reference_line) && !kept.empty() &&
         to_lower(kept.back().text).find("as shown in") != std::string::npos;
     const bool protected_section_suffix =
         page.layout_family == LayoutFamily::FrontiersRail &&
-        std::regex_match(
-            line.text,
-            std::regex(R"(^\s*20\d{2}\s*[-–]\s*20\d{2}\s*$)")) &&
-        !kept.empty() &&
+        std::regex_match(line.text, year_range) && !kept.empty() &&
         to_lower(kept.back().text).find("current history") !=
             std::string::npos;
     if (protected_reference || protected_section_suffix) {
       kept.push_back(std::move(line));
       continue;
     }
+    // Per-line values, refreshed whenever an erasure changes the text.
+    bool short_figure_reference = false;
+    std::string folded_line;
+    size_t line_words = 0;
+    auto refresh = [&] {
+      low = to_lower(line.text);
+      short_figure_reference = std::regex_match(line.text, figure_reference_line);
+      folded_line = fold_alnum(low);
+      line_words = split_words(low).size();
+    };
+    refresh();
     for (const auto& visual_line : visual_lines) {
       const auto& visual = visual_line.text;
       if (visual.size() >= 8 && low == visual) {
@@ -838,43 +918,53 @@ std::vector<TextLine> quarantine_stream_lines(
         const auto position = low.find(visual);
         if (position != std::string::npos) {
           const bool inline_figure_reference =
-              visual_line.region == RegionKind::Float &&
-              std::regex_match(
-                  visual,
-                  std::regex(R"(^figure\s+\d+[a-z]?[\.,]?$)",
-                             std::regex::icase)) &&
-              to_lower(line.text.substr(0, position))
-                      .ends_with("as shown in ");
+              visual_line.region == RegionKind::Float && visual_line.figure_reference &&
+              to_lower(line.text.substr(0, position)).ends_with("as shown in ");
           if (inline_figure_reference) continue;
           line.text.erase(position, visual.size());
           line.text = collapse_ws(line.text);
-          low = to_lower(line.text);
+          refresh();
           if (line.text.empty()) {
             remove = true;
             break;
           }
           continue;
         }
-        const bool short_figure_reference = std::regex_match(
-            line.text,
-            std::regex(R"(^\s*figure\s+\d+[a-z]?[\.,]?\s*$)",
-                       std::regex::icase));
         if (low.size() >= 8 && visual.find(low) != std::string::npos &&
             (visual_line.region != RegionKind::Float ||
              !short_figure_reference)) {
           remove = true;
           break;
         }
-      }
-      const auto tokens = split_words(visual);
-      if (tokens.size() >= 4) {
-        const std::string prefix =
-            tokens[0] + " " + tokens[1] + " " + tokens[2] + " " + tokens[3];
-        if (low.rfind(prefix, 0) == 0 &&
-            visual_line.region != RegionKind::Float) {
+        // The streams space the same glyphs differently ("R. O R G" against
+        // "R . O R G"): failing an exact match, compare alphanumerics only.
+        // Only for page chrome: float and footnote islands can over-reach
+        // into body text, which must not be removed on a looser match. A
+        // line of one or two words ("hypertext.") would be found inside any
+        // long quarantined block, so this also needs a few words.
+        const bool chrome = visual_line.region == RegionKind::Header ||
+                            visual_line.region == RegionKind::Footer ||
+                            visual_line.region == RegionKind::MarginOverlay;
+        if (chrome && folded_line.size() >= 12 && line_words >= 3 &&
+            visual_line.folded.find(folded_line) != std::string::npos) {
           remove = true;
           break;
         }
+        if (chrome && visual_line.folded.size() >= 12 &&
+            folded_line.find(visual_line.folded) != std::string::npos &&
+            erase_folded_words(line.text, visual_line.folded)) {
+          refresh();
+          if (line.text.empty()) {
+            remove = true;
+            break;
+          }
+          continue;
+        }
+      }
+      if (!visual_line.prefix.empty() && low.rfind(visual_line.prefix, 0) == 0 &&
+          visual_line.region != RegionKind::Float) {
+        remove = true;
+        break;
       }
     }
     if (!remove) kept.push_back(std::move(line));

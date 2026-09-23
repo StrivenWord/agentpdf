@@ -73,6 +73,10 @@ bool is_boilerplate_line(const std::string& text) {
       "copyright ©",
       "copyright (c)",
       "copyright 20",
+      // First-page history rail (MDPI and others).
+      "academic editor",
+      "published:",
+      "this article is an open access article",
   };
   for (const char* k : prefixes) {
     if (low.rfind(k, 0) == 0) return true;
@@ -95,6 +99,10 @@ bool is_boilerplate_line(const std::string& text) {
       "dls in application",
       "frontiers in political science",
       "chin jj and kirkpatrick",
+      // Aggregator stamp on every ProQuest page.
+      "reproduced with permission of copyright owner",
+      "reproduced with permission of the copyright owner",
+      "further reproduction prohibited without permission",
   };
   for (const char* k : contains) {
     if (low.find(k) != std::string::npos) return true;
@@ -102,6 +110,17 @@ bool is_boilerplate_line(const std::string& text) {
   static const std::regex publication_date(
       R"(^published\s+\d{1,2}\s+[a-z]+\s+\d{4}\b)", std::regex::icase);
   if (std::regex_search(low, publication_date)) return true;
+  // Wrapped remainders of licence statements and aggregator stamps, alone
+  // on their lines.
+  if (low == "distributed under the terms and" ||
+      low == "distributed under the terms and conditions" ||
+      low == "prohibited without permission." || low == "prohibited without permission")
+    return true;
+  // A citation strip, "Energies 2026, 19, 4153" or "Journal. Media 2026, 7,
+  // 178". Body-only: metadata reads journal, volume and page from it.
+  static const std::regex citation_strip(
+      R"(^[A-Z][A-Za-z.&\- ]{1,60}\s(?:19|20)\d{2},\s*\d{1,4},\s*\d{1,6}$)");
+  if (std::regex_match(trim(text), citation_strip)) return true;
   return false;
 }
 
@@ -202,12 +221,162 @@ bool is_figure_caption(const std::string& text) {
   return low.find("figure ") == 0 || low.find("fig. ") == 0 || low.find("table ") == 0;
 }
 
-int heading_level_for(const std::string& text, const Heuristics& h, bool magazine) {
+// How a heading candidate was recognised. A section name is decisive; a
+// section number or capitals are only cues, which equations, table cells,
+// reference entries and figure labels share, so those candidates must also
+// be typeset as headings when the text layer says how they are typeset.
+enum class HeadingCue { None, Label, Numbered, Capitals };
+
+// Mathematical notation: relations, operators and arrows. Headings carry
+// none; display equations broken into short lines are full of them.
+bool has_math_notation(const std::string& text) {
+  if (text.find_first_of("=<>^_{}|~") != std::string::npos) return true;
+  if (text.find(" + ") != std::string::npos) return true;
+  for (size_t i = 0; i + 1 < text.size(); ++i) {
+    const auto a = static_cast<unsigned char>(text[i]);
+    const auto b = static_cast<unsigned char>(text[i + 1]);
+    if (a == 0xC2 && (b == 0xB1 || b == 0xB7)) return true;  // ± ·
+    if (a == 0xC3 && (b == 0x97 || b == 0xB7)) return true;  // × ÷
+    if (a == 0xE2 && b >= 0x86 && b <= 0x8B) return true;    // U+2180–U+22FF arrows, operators
+    if (a == 0xE2 && b == 0x97 && i + 2 < text.size() &&
+        static_cast<unsigned char>(text[i + 2]) == 0xA6)      // ◦
+      return true;
+  }
+  return false;
+}
+
+// ASCII letters of a line and how many are capitals, plus the longest run
+// of letters, where a multi-byte UTF-8 character counts as one letter of
+// unknown case ("GİRİŞ" is a five-letter run).
+void count_letters(const std::string& text, int& letters, int& uppers, int& longest_run) {
+  letters = uppers = longest_run = 0;
+  int run = 0;
+  for (unsigned char c : text) {
+    if (std::isalpha(c)) {
+      ++letters;
+      if (std::isupper(c)) ++uppers;
+      longest_run = std::max(longest_run, ++run);
+    } else if (c >= 0xC0) {
+      longest_run = std::max(longest_run, ++run);
+    } else if (c < 0x80) {
+      run = 0;
+    }
+  }
+}
+
+bool is_all_capitals(const std::string& text) {
+  int letters = 0, uppers = 0, run = 0;
+  count_letters(text, letters, uppers, run);
+  return letters >= 2 && uppers * 10 >= letters * 9;
+}
+
+// A section title opens with a capital (any non-ASCII letter counts: case is
+// not decoded), or with a digit glued to letters ("3D Printing").
+bool starts_like_title(const std::string& title) {
+  if (title.empty()) return false;
+  const auto c = static_cast<unsigned char>(title[0]);
+  if (std::isupper(c)) return true;
+  if (std::isdigit(c)) {
+    size_t i = 0;
+    while (i < title.size() && std::isdigit(static_cast<unsigned char>(title[i]))) ++i;
+    return i < title.size() && std::isalpha(static_cast<unsigned char>(title[i]));
+  }
+  if ((c == '"' || c == '\'') && title.size() > 1)
+    return std::isupper(static_cast<unsigned char>(title[1])) != 0;
+  // Two-byte letters (Latin, Greek, Cyrillic) and CJK; U+2000–U+2FFF
+  // (E2 lead byte) is punctuation and symbols.
+  return (c >= 0xC3 && c <= 0xDF) || (c >= 0xE3 && c <= 0xEF);
+}
+
+// A numbered bibliography entry: "3. Grubler, A., Wilson, C.", "4. Gupta T
+// (2024) Evolution…", "2. Government of Japan. (2021).".
+bool looks_like_reference_entry(const std::string& title) {
+  static const std::regex year(R"(\((?:19|20)\d{2}[a-z]?\))");
+  static const std::regex surname_initial(R"(^[A-Z][A-Za-z'\-]+,\s+[A-Z]\.)");
+  static const std::regex surname_bare_initials(R"(^[A-Z][a-z'\-]+\s[A-Z]{1,3},\s)");
+  static const std::regex et_al(R"(\bet al\b)");
+  return std::regex_search(title, year) || std::regex_search(title, surname_initial) ||
+         std::regex_search(title, surname_bare_initials) || std::regex_search(title, et_al);
+}
+
+// The title after a section number must read as a title: a capital first,
+// letters rather than numbers or symbols, and not a sentence (a numbered
+// list item) or a wrapped prose line.
+bool numbered_title_ok(const std::string& title) {
+  if (!starts_like_title(title) || has_math_notation(title)) return false;
+  if (looks_like_reference_entry(title)) return false;
+  int letters = 0, uppers = 0, run = 0;
+  count_letters(title, letters, uppers, run);
+  if (run < 3) return false;  // "55 KW", "0 10 20 30"
+  const auto words = split_words(title);
+  // (A trailing comma proves nothing: long titles wrap after one, "2. A
+  // current history of coups in Africa," / "2020–2022".)
+  if (words.size() > 20 || title.back() == ';') return false;
+  if (words.size() >= 5) {
+    if (ends_sentence_like(title)) return false;
+    static const std::regex inner_sentence(R"([a-z]{2}\.\s+[A-Z0-9(])");
+    if (std::regex_search(title, inner_sentence)) return false;
+  }
+  return true;
+}
+
+// The first line of a numbered bibliography entry: "12. Conklin, J.",
+// "[25] B. Acun", "(69) Sharma, S.".
+bool is_bibliography_entry_start(const std::string& text) {
+  static const std::regex entry(R"(^(?:\[\d{1,3}\]|\(\d{1,3}\)|\d{1,3}\.)\s+["A-Z\xC0-\xFF])");
+  return std::regex_search(text, entry);
+}
+
+// A short line set in capitals ("RESULTS", "DATA AVAILABILITY"), not an
+// acronym-laden equation or table fragment ("PES,c", "Load/MW", "12 GB").
+bool capitals_line_ok(const std::string& text) {
+  if (text.size() >= 80 || text.find('.') != std::string::npos) return false;
+  int letters = 0, uppers = 0, run = 0;
+  count_letters(text, letters, uppers, run);
+  if (letters < 4 || run < 3 || uppers * 10 < letters * 9) return false;
+  if (has_math_notation(text) || text.find_first_of("/[]") != std::string::npos) return false;
+  // A comma glued to what follows is a subscript list ("PES,c").
+  for (size_t i = 0; i + 1 < text.size(); ++i) {
+    if (text[i] == ',' && !std::isspace(static_cast<unsigned char>(text[i + 1]))) return false;
+  }
+  int digits = 0;
+  for (unsigned char c : text) digits += std::isdigit(c) ? 1 : 0;
+  return digits * 5 <= letters + digits;
+}
+
+// Is the line typeset as a heading: set apart from body text by weight,
+// slant, size or small capitals? Bold headings may be a little smaller than
+// the body (0.9x in the corpus: Arial-Bold 11pt over Times 12pt); table
+// cells, figure labels and sub/superscripts are far smaller (0.6-0.8x).
+// Without typographic evidence (OCR, or a line not found in the text layer)
+// only the text cues decide.
+bool typeset_as_heading(const TextLine& line, const std::string& text, const DocumentDom& dom) {
+  const double body = dom.body_font_size;
+  if (body <= 0 || line.font_size <= 0) return true;
+  if (line.font_size_max < body * 0.88) return false;
+  if (line.bold && !dom.body_font_heavy) return true;
+  if (line.font_size_max < body * 0.95) return false;
+  if (line.italic) return true;
+  if (line.font_size >= body * 1.08) return true;
+  // Small capitals: capital initials at body size, the other letters smaller
+  // ("R EFERENCES"). A subscripted symbol mixes sizes the same way
+  // ("PCCS": italic P, subscript CCS) but is short.
+  int letters = 0, uppers = 0, run = 0;
+  count_letters(text, letters, uppers, run);
+  return letters >= 8 && is_all_capitals(text) && line.font_size < line.font_size_max * 0.95;
+}
+
+int heading_level_for(const std::string& text, const Heuristics& h, bool magazine,
+                      HeadingCue& cue) {
   auto t = trim(text);
   auto low = to_lower(t);
+  cue = HeadingCue::Label;
+  // "Appendix", "Appendix A", "Appendix B. Technical data"; not prose that
+  // opens with a reference to one ("Appendix A). Our tool…").
+  static const std::regex appendix(R"(^(?:[Aa]ppendix|APPENDIX)(?:\s+[A-Z0-9]{1,3}(?:\.\d+)*[\.:]?(?:\s+\S.*)?)?$)");
   if (low == "abstract" || low == "references" || low == "conclusion" ||
-      low == "acknowledgments" || low == "acknowledgements" || low == "appendix" ||
-      low.find("appendix ") == 0) {
+      low == "acknowledgments" || low == "acknowledgements" ||
+      (low.rfind("appendix", 0) == 0 && std::regex_match(t, appendix))) {
     return 1;
   }
   if (low == "keywords" || low == "key words") return h.keywords_as_h2 ? 2 : 1;
@@ -223,11 +392,16 @@ int heading_level_for(const std::string& text, const Heuristics& h, bool magazin
   if (low == "general terms" || low == "categories and subject descriptors") return 1;
 
   std::smatch m;
-  // Section numbers are followed by a capitalised title; a wrapped prose line
-  // that happens to begin with a quantity ("200 acres of…", "6 - 1 vote") is
-  // not a heading.
-  static const std::regex numbered(R"(^(\d{1,3}(?:\.\d+)*)[\.\)]?\s+[^a-z\s\-])");
-  if (h.nest_numeric_headings && std::regex_search(t, m, numbered)) {
+  // Section numbers (no leading zero, at most two digits per level) followed
+  // by a title; a wrapped prose line that happens to begin with a quantity
+  // ("200 acres of…", "6 - 1 vote", "1.15 (the lower…") is not a heading.
+  static const std::regex numbered(R"(^([1-9]\d?(?:\.\d{1,2})*)[\.\)]?\s+(\S.*)$)");
+  if (h.nest_numeric_headings && std::regex_match(t, m, numbered)) {
+    cue = HeadingCue::Numbered;
+    if (!numbered_title_ok(m[2].str())) {
+      cue = HeadingCue::None;
+      return 0;
+    }
     std::string num = m[1];
     int depth = static_cast<int>(std::count(num.begin(), num.end(), '.')) + 1;
     return std::min(depth, 6);
@@ -251,16 +425,9 @@ int heading_level_for(const std::string& text, const Heuristics& h, bool magazin
     if (magazine && low.find(std::string(s) + " ") == 0) return 1;
   }
 
-  if (t.size() < 80 && t.find('.') == std::string::npos) {
-    int letters = 0, uppers = 0;
-    for (unsigned char c : t) {
-      if (std::isalpha(c)) {
-        ++letters;
-        if (std::isupper(c)) ++uppers;
-      }
-    }
-    if (letters >= 4 && uppers >= letters / 2) return 1;
-  }
+  cue = HeadingCue::Capitals;
+  if (capitals_line_ok(t)) return 1;
+  cue = HeadingCue::None;
   return 0;
 }
 
@@ -338,20 +505,6 @@ struct BodyAnchor {
   size_t line = 0;
 };
 
-// Where the article body begins: the earliest of (a) an Abstract, Keywords or
-// Introduction label and (b) the first run of sustained prose, searched over
-// the first three content pages. Title blocks, bylines, affiliations and
-// masthead lines before it are front matter. Without either signal the body
-// starts at the first line: never discard a whole document.
-std::string alnum_lower(const std::string& s) {
-  std::string out;
-  for (unsigned char c : s) {
-    if (std::isalnum(c)) out.push_back(static_cast<char>(std::tolower(c)));
-    else if (c >= 0x80) out.push_back(static_cast<char>(c));
-  }
-  return out;
-}
-
 // Does sustained prose begin at lines[i]? Wide-column text shows it in one
 // line; narrow magazine columns (3-7 words per line) only across a short run
 // of consecutive lines. Lines belonging to the printed title never qualify.
@@ -362,7 +515,7 @@ bool starts_prose_run(const std::vector<TextLine>& lines, size_t i,
   const size_t first_words = split_words(first).size();
   if (first_words < 3 || lowercase_word_share(first) < 0.5) return false;
   if (is_provenance_line(first) || is_boilerplate_line(first)) return false;
-  const auto folded_first = alnum_lower(first);
+  const auto folded_first = fold_alnum(first);
   if (!folded_title.empty() && folded_first.size() >= 6 &&
       folded_title.find(folded_first) != std::string::npos)
     return false;
@@ -384,8 +537,34 @@ bool starts_prose_run(const std::vector<TextLine>& lines, size_t i,
   return run >= 3 && words >= 15 && lower / static_cast<double>(words) >= 0.55;
 }
 
+// A heading with no content after it labels nothing: remove headings from
+// the end of the blocks emitted so far (pages up to `last_page`), unless
+// nothing else precedes them.
+void drop_trailing_headings(DocumentDom& dom, int last_page) {
+  const bool has_content = std::any_of(dom.pages.begin(), dom.pages.end(), [&](const PageDom& p) {
+    return p.index <= last_page &&
+           std::any_of(p.blocks.begin(), p.blocks.end(),
+                       [](const Block& b) { return b.kind != BlockKind::Heading; });
+  });
+  if (!has_content) return;
+  for (auto page = dom.pages.rbegin(); page != dom.pages.rend(); ++page) {
+    if (page->index > last_page) continue;
+    auto& blocks = page->blocks;
+    while (!blocks.empty() && blocks.back().kind == BlockKind::Heading) {
+      blocks.pop_back();
+      --dom.heading_count;
+    }
+    if (!blocks.empty()) return;
+  }
+}
+
+// Where the article body begins: the earliest of (a) an Abstract, Keywords or
+// Introduction label and (b) the first run of sustained prose, searched over
+// the first three content pages. Title blocks, bylines, affiliations and
+// masthead lines before it are front matter. Without either signal the body
+// starts at the first line: never discard a whole document.
 BodyAnchor find_body_anchor(const DocumentDom& dom) {
-  const std::string folded_title = alnum_lower(dom.meta.title);
+  const std::string folded_title = fold_alnum(dom.meta.title);
   std::optional<BodyAnchor> label_anchor;
   std::optional<BodyAnchor> prose_anchor;
   std::optional<BodyAnchor> first_line;
@@ -411,7 +590,7 @@ BodyAnchor find_body_anchor(const DocumentDom& dom) {
         const auto first = collapse_ws(normalize_typography(page.lines[i].text));
         if (i > 0 && std::islower(static_cast<unsigned char>(first.front()))) {
           const auto prev = collapse_ws(normalize_typography(page.lines[i - 1].text));
-          const auto folded_prev = alnum_lower(prev);
+          const auto folded_prev = fold_alnum(prev);
           const bool ends_sentence = !prev.empty() && (prev.back() == '.' || prev.back() == ':');
           if (split_words(prev).size() >= 2 && !ends_sentence &&
               front_label_of(prev) == FrontLabel::None && !is_provenance_line(prev) &&
@@ -488,7 +667,12 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         for (size_t j = i; j < page.lines.size() && j < i + 12; ++j) {
           if (is_record_field_label(page.lines[j].text)) ++fields;
         }
-        if (fields >= 3) in_record_trailer = true;
+        if (fields >= 3) {
+          in_record_trailer = true;
+          // The record's own section label ("DETAILS") goes with it.
+          flush();
+          drop_trailing_headings(dom, page.index);
+        }
       }
       if (in_record_trailer) {
         flush();
@@ -720,8 +904,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         text = after;
       }
 
+      HeadingCue cue = HeadingCue::None;
       int hl = heading_level_for(text, heuristics,
-                                 page.layout_family == LayoutFamily::MagazineTwoColumn);
+                                 page.layout_family == LayoutFamily::MagazineTwoColumn, cue);
+      if (hl > 0 && cue != HeadingCue::Label && !typeset_as_heading(line, text, dom)) hl = 0;
       if (hl > 0 && text.size() < 120 && glued_heading.empty()) {
         // Avoid classifying long paragraphs that merely start with a section phrase.
         auto low = to_lower(text);
@@ -755,6 +941,17 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         fb.box = line.box;
         fb.page = page.index;
         page.blocks.push_back(fb);
+        continue;
+      }
+
+      // Numbered bibliography entries each open a paragraph.
+      if (references_seen && is_bibliography_entry_start(text)) {
+        flush();
+        cur.kind = BlockKind::Paragraph;
+        cur.text = text;
+        cur.box = line.box;
+        cur.page = page.index;
+        cur.entry_start = true;
         continue;
       }
 
@@ -799,6 +996,9 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     }
     flush();
   }
+  // Furniture labels whose content was dropped (a masthead line, an
+  // aggregator section label) would otherwise end the note.
+  if (!dom.pages.empty()) drop_trailing_headings(dom, dom.pages.back().index);
 
   // PDF line/column/page object boundaries are not paragraph boundaries.
   // Rejoin paragraph blocks that were split only because the previous text
@@ -825,7 +1025,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     merged.reserve(page.blocks.size());
     for (auto& block : page.blocks) {
       if (!merged.empty() && merged.back().kind == BlockKind::Paragraph &&
-          block.kind == BlockKind::Paragraph &&
+          block.kind == BlockKind::Paragraph && !block.entry_start &&
           !ends_sentence_like(merged.back().text)) {
         append_paragraph(merged.back(), block);
         continue;
@@ -841,7 +1041,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     auto& a = prev.blocks.back();
     auto& b = cur.blocks.front();
     if (a.kind != BlockKind::Paragraph || b.kind != BlockKind::Paragraph) continue;
-    if (ends_sentence_like(a.text)) continue;
+    if (b.entry_start || ends_sentence_like(a.text)) continue;
     append_paragraph(a, b);
     cur.blocks.erase(cur.blocks.begin());
   }

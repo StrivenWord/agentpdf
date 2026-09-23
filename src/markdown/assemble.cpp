@@ -121,7 +121,14 @@ std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristi
     }
   }
 
-  return yaml + body.str();
+  // normalize_typography already maps control characters to spaces; this
+  // guarantees none reaches the note whatever path the text took.
+  std::string text = body.str();
+  for (auto& c : text) {
+    const auto u = static_cast<unsigned char>(c);
+    if ((u < 0x20 && c != '\n') || u == 0x7F) c = ' ';
+  }
+  return yaml + text;
 }
 
 }  // namespace agentpdf

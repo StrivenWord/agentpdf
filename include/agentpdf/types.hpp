@@ -165,9 +165,25 @@ struct TextSpan {
   bool italic = false;
 };
 
+// Typographic evidence for one text-layer word, kept for every page: heading
+// detection compares a line's type with the body text's. `folded` is the
+// word's lowercase alphanumerics (fold_alnum), the key that aligns any line
+// stream (flow, raw, geometry) back to its words.
+struct StyledWord {
+  std::string folded;
+  double font_size = 0;
+  bool heavy = false;   // bold, semibold, medium, black… weight
+  bool italic = false;
+};
+
 struct TextLine {
   std::string text;
   BBox box;
+  // Typography of the words the line was located at (annotate_line_typography).
+  // font_size 0 means no evidence: OCR text, or a line not found in the text
+  // layer; text cues alone then decide.
+  double font_size = 0;      // character-weighted mean
+  double font_size_max = 0;
   bool bold = false;
   bool italic = false;
 };
@@ -179,6 +195,9 @@ struct Block {
   BBox box;
   int column = 0;
   int page = 0;
+  // Opens a numbered bibliography entry: never joined to the paragraph
+  // before it, however that one ends.
+  bool entry_start = false;
   std::vector<std::vector<std::string>> table_rows;
 };
 
@@ -196,6 +215,7 @@ struct PageDom {
   std::optional<double> column_cut_override;
   std::vector<BBox> ocr_content_regions;  // Content bounding boxes from Leptonica
   std::vector<NormalizedTextBox> normalized_boxes;
+  std::vector<StyledWord> styled_words;  // text-layer order
   std::vector<TextLine> lines;
   std::vector<Block> blocks;
 };
@@ -213,6 +233,11 @@ struct DocumentDom {
   // of the first pages, used only for metadata. Body classification keeps
   // using PageDom::normalized_boxes.
   std::vector<std::vector<NormalizedTextBox>> front_boxes;
+  // Body text type: the character-weighted most common word size, and
+  // whether its face is itself a heavy weight (bold is then no cue). 0 when
+  // the document has no usable typographic evidence (scans).
+  double body_font_size = 0;
+  bool body_font_heavy = false;
   std::vector<PageDom> pages;
   std::vector<std::string> endnotes;
   int heading_count = 0;

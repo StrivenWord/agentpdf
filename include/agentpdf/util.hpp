@@ -23,6 +23,10 @@ bool write_object_file(const std::string& path,
 std::string trim(const std::string& s);
 std::string collapse_ws(const std::string& s);
 std::string normalize_typography(const std::string& s);
+// Lowercase ASCII alphanumerics plus every non-ASCII byte, nothing else:
+// the same text spaced or punctuated differently by two Poppler streams
+// folds to the same key.
+std::string fold_alnum(const std::string& s);
 std::string to_lower(const std::string& s);
 std::vector<std::string> split_words(const std::string& s);
 std::string join(const std::vector<std::string>& parts, const std::string& sep);

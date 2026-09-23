@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -334,15 +335,18 @@ std::vector<RawBox> collect_raw_boxes(poppler::page& page) {
   return raw;
 }
 
+// Every word of the page's text layer, with its type, plus the styled words
+// heading detection reads. Body classification deliberately runs without
+// font sizes (its dormant small-font footnote rule would quarantine text
+// without endnote conversion), so the caller strips them from body boxes;
+// front-matter evidence keeps them.
 std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
-                                                       bool include_font = false) {
+                                                       std::vector<StyledWord>& styled) {
   std::vector<NormalizedTextBox> result;
-  // Body classification deliberately runs without font sizes (its dormant
-  // small-font footnote rule would quarantine text without endnote
-  // conversion); only front-matter evidence requests them.
-  auto boxes = include_font ? page.text_list(poppler::page::text_list_include_font)
-                            : page.text_list();
+  auto boxes = page.text_list(poppler::page::text_list_include_font);
   result.reserve(boxes.size());
+  styled.clear();
+  styled.reserve(boxes.size());
   for (const auto& source : boxes) {
     NormalizedTextBox box;
     box.text = collapse_ws(normalize_typography(ustring_to_utf8(source.text())));
@@ -351,6 +355,8 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
     box.box = BBox{rect.x(), rect.y(), rect.x() + rect.width(),
                    rect.y() + rect.height()};
     box.rotation = source.rotation();
+    StyledWord word;
+    word.folded = fold_alnum(box.text);
     if (source.has_font_info()) {
       box.font_size = source.get_font_size();
       const auto font = to_lower(source.get_font_name());
@@ -360,10 +366,95 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
       for (const char* style : {"italic", "oblique"}) {
         if (font.find(style) != std::string::npos) box.italic = true;
       }
+      // Heading faces also come as Medium (IEEE's NimbusRomNo9L-Medi) and
+      // abbreviated Semibold (ArnoPro-Smbd).
+      word.heavy = box.bold || font.find("medi") != std::string::npos ||
+                   font.find("smbd") != std::string::npos;
+      word.italic = box.italic;
+      word.font_size = box.font_size;
     }
+    if (!word.folded.empty()) styled.push_back(std::move(word));
     result.push_back(std::move(box));
   }
   return result;
+}
+
+// The body text's type: the most common word size, weighted by characters
+// (sizes bucketed to 0.1 pt), and whether most body-size text is heavy.
+void measure_body_font(DocumentDom& dom) {
+  std::map<long, size_t> chars_by_size;
+  for (const auto& page : dom.pages) {
+    for (const auto& word : page.styled_words) {
+      if (word.font_size > 0)
+        chars_by_size[std::lround(word.font_size * 10.0)] += word.folded.size();
+    }
+  }
+  if (chars_by_size.empty()) return;
+  const auto mode = std::max_element(
+      chars_by_size.begin(), chars_by_size.end(),
+      [](const auto& a, const auto& b) { return a.second < b.second; });
+  dom.body_font_size = static_cast<double>(mode->first) / 10.0;
+  size_t body_chars = 0, heavy_chars = 0;
+  for (const auto& page : dom.pages) {
+    for (const auto& word : page.styled_words) {
+      if (std::lround(word.font_size * 10.0) != mode->first) continue;
+      body_chars += word.folded.size();
+      if (word.heavy) heavy_chars += word.folded.size();
+    }
+  }
+  dom.body_font_heavy = heavy_chars * 2 > body_chars;
+}
+
+// Locate each line in the page's styled words and record their type. Keys
+// are folded (fold_alnum), so the streams' different spacing and hyphen
+// joins still align, and a match must start and end on word boundaries. The
+// search runs forward from the previous match, since every stream follows
+// roughly the text layer's order, and falls back to the whole page.
+void annotate_line_typography(PageDom& page) {
+  if (page.used_ocr || page.styled_words.empty() || page.lines.empty()) return;
+  std::string folded;
+  std::vector<size_t> owner;
+  std::vector<bool> word_start;
+  for (size_t k = 0; k < page.styled_words.size(); ++k) {
+    const auto& key = page.styled_words[k].folded;
+    for (size_t c = 0; c < key.size(); ++c) {
+      folded.push_back(key[c]);
+      owner.push_back(k);
+      word_start.push_back(c == 0);
+    }
+  }
+  word_start.push_back(true);  // the end of the page is a boundary
+  auto find_aligned = [&](const std::string& key, size_t from) {
+    for (size_t pos = folded.find(key, from); pos != std::string::npos;
+         pos = folded.find(key, pos + 1)) {
+      if (word_start[pos] && word_start[pos + key.size()]) return pos;
+    }
+    return std::string::npos;
+  };
+  size_t cursor = 0;
+  for (auto& line : page.lines) {
+    const auto key = fold_alnum(normalize_typography(line.text));
+    if (key.size() < 3) continue;
+    size_t pos = find_aligned(key, cursor);
+    if (pos == std::string::npos) pos = find_aligned(key, 0);
+    if (pos == std::string::npos) continue;
+    double chars = 0, size_sum = 0, size_max = 0, heavy = 0, italic = 0;
+    for (size_t i = pos; i < pos + key.size(); ++i) {
+      const auto& word = page.styled_words[owner[i]];
+      if (word.font_size <= 0) continue;
+      chars += 1;
+      size_sum += word.font_size;
+      size_max = std::max(size_max, word.font_size);
+      if (word.heavy) heavy += 1;
+      if (word.italic) italic += 1;
+    }
+    cursor = pos + key.size();
+    if (chars == 0) continue;
+    line.font_size = size_sum / chars;
+    line.font_size_max = size_max;
+    line.bold = heavy / chars >= 0.6;
+    line.italic = italic / chars >= 0.6;
+  }
 }
 
 // A scanned page carries a page-covering raster image. Rendered on white and
@@ -479,13 +570,18 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
       auto rect = page->page_rect();
       pd.width = rect.width();
       pd.height = rect.height();
-      pd.normalized_boxes = collect_normalized_boxes(*page);
+      auto boxes = collect_normalized_boxes(*page, pd.styled_words);
       if (pi < front_pages) {
-        result.dom.front_boxes.push_back(collect_normalized_boxes(*page, true));
+        result.dom.front_boxes.push_back(boxes);
         std::string text;
-        for (const auto& box : pd.normalized_boxes) text += box.text + ' ';
+        for (const auto& box : boxes) text += box.text + ' ';
         signals.page_text.push_back(to_lower(text));
       }
+      for (auto& box : boxes) {
+        box.font_size = 0;
+        box.bold = box.italic = false;
+      }
+      pd.normalized_boxes = std::move(boxes);
     }
     pages.push_back(std::move(pd));
   }
@@ -638,6 +734,19 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   }
 
   stitch_document_lines(result.dom, heuristics);
+
+  // Typographic evidence for heading detection. A scan's text layer is an
+  // invisible OCR font of uniform size, which says nothing about headings.
+  if (family != LayoutFamily::ScanOcrTwoColumn) {
+    measure_body_font(result.dom);
+    if (result.dom.body_font_size > 0) {
+      for (auto& pd : pages) annotate_line_typography(pd);
+    }
+  }
+  for (auto& pd : pages) {
+    pd.styled_words.clear();
+    pd.styled_words.shrink_to_fit();
+  }
   result.ok = true;
   return result;
 }
