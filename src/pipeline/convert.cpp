@@ -3,6 +3,7 @@
 #include "agentpdf/util.hpp"
 
 #include <iostream>
+#include <string>
 
 namespace agentpdf {
 
@@ -20,6 +21,20 @@ bool convert_document(const JobEntry& job, const Heuristics& heuristics,
   build_blocks_from_lines(dom, heuristics);
   isolate_footnotes(dom, heuristics);
   extract_and_validate_metadata(dom, meta_spec);
+
+  // A conversion without body text is a failure, whatever metadata was
+  // found: no Markdown is written, so an empty note never enters the vault.
+  // (Missing metadata alone does not fail a conversion.)
+  size_t body_words = 0;
+  for (const auto& page : dom.pages) {
+    for (const auto& block : page.blocks) body_words += split_words(block.text).size();
+  }
+  for (const auto& note : dom.endnotes) body_words += split_words(note).size();
+  if (body_words == 0) {
+    err = "empty body: no text could be extracted (" + std::to_string(dom.pages.size()) +
+          " pages)";
+    return false;
+  }
 
   // Drop abstract paragraph duplicate from body if stored in YAML (keep heading).
   // Keep body abstract for ACM-style papers where handmade includes ABSTRACT section.
