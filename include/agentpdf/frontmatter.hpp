@@ -42,6 +42,10 @@ bool is_prose_line(const std::string& line);
 // Lowercase-initial share of a line's words (0 when it has none).
 double lowercase_word_share(const std::string& line);
 
+// Lowercase ASCII plus the Latin-1 / Latin Extended-A capitals of the
+// corpus languages (Ö, Ü, Ç, É, İ, Ş, Ğ, …).
+std::string fold_lower_utf8(const std::string& text);
+
 // Decode the HTML/XML character references that appear in PDF Info strings.
 std::string decode_html_entities(const std::string& text);
 

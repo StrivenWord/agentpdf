@@ -37,6 +37,8 @@ set(AGENTPDF_SOURCES
   src/text/structure.cpp
   src/text/frontmatter.cpp
   src/meta/extract.cpp
+  src/meta/fields.cpp
+  src/meta/bibliographic.cpp
   src/markdown/assemble.cpp
   src/pipeline/convert.cpp
   src/report/run_stats.cpp
@@ -58,6 +60,25 @@ if (AGENTPDF_ENABLE_SSE42)
 endif()
 
 add_executable(agentpdf ${AGENTPDF_SOURCES})
+
+# Version recorded in each note's `agentpdf-version` property: the project
+# version plus `git describe` when the source tree is a git checkout (read at
+# configure time; re-run CMake to refresh it).
+set(AGENTPDF_VERSION_STRING "${PROJECT_VERSION}")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --always --dirty
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE AGENTPDF_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE AGENTPDF_GIT_RESULT)
+  if(AGENTPDF_GIT_RESULT EQUAL 0 AND AGENTPDF_GIT_DESCRIBE)
+    set(AGENTPDF_VERSION_STRING "${PROJECT_VERSION}+${AGENTPDF_GIT_DESCRIBE}")
+  endif()
+endif()
+target_compile_definitions(agentpdf PRIVATE AGENTPDF_VERSION="${AGENTPDF_VERSION_STRING}")
 
 target_include_directories(agentpdf PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src

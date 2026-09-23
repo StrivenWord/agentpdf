@@ -77,47 +77,9 @@ bool is_title_duplicate(const std::string& block, const std::string& title) {
 
 }  // namespace
 
-std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristics) {
-  std::ostringstream yaml;
-  yaml << "---\n";
-  yaml << "title: " << yaml_escape(dom.meta.title) << "\n";
-  yaml << "authors:\n";
-  if (dom.meta.authors.empty()) {
-    yaml << "  []\n";
-  } else {
-    for (const auto& a : dom.meta.authors) yaml << "  - " << yaml_escape(a) << "\n";
-  }
-  if (!dom.meta.date_published.empty())
-    yaml << "date-published: " << yaml_escape(dom.meta.date_published) << "\n";
-  if (!dom.meta.date_received.empty())
-    yaml << "date-received: " << yaml_escape(dom.meta.date_received) << "\n";
-  if (!dom.meta.date_accepted.empty())
-    yaml << "date-accepted: " << yaml_escape(dom.meta.date_accepted) << "\n";
-  if (!dom.meta.publisher.empty())
-    yaml << "publisher: " << yaml_escape(dom.meta.publisher) << "\n";
-  if (!dom.meta.object_url.empty())
-    yaml << "object-url: " << yaml_escape(dom.meta.object_url) << "\n";
-  yaml << "source-format: " << yaml_escape(dom.meta.source_format) << "\n";
-  if (!dom.meta.published_formats.empty())
-    yaml << "published-formats: " << yaml_escape(dom.meta.published_formats) << "\n";
-  if (!dom.meta.doi.empty()) yaml << "doi: " << yaml_escape(dom.meta.doi) << "\n";
-  if (!dom.meta.type.empty()) yaml << "type: " << yaml_escape(dom.meta.type) << "\n";
-  if (!dom.meta.pages.empty()) yaml << "pages: " << yaml_escape(dom.meta.pages) << "\n";
-  if (!dom.meta.date_accessed.empty())
-    yaml << "date-accessed: " << yaml_escape(dom.meta.date_accessed) << "\n";
-  if (!dom.meta.date_extracted.empty())
-    yaml << "date-extracted: " << yaml_escape(dom.meta.date_extracted) << "\n";
-  if (!dom.meta.keywords.empty()) {
-    yaml << "keywords:\n";
-    for (const auto& k : dom.meta.keywords) yaml << "  - " << yaml_escape(k) << "\n";
-  }
-  if (!dom.meta.abstract_text.empty()) {
-    yaml << "abstract: |\n";
-    std::istringstream iss(dom.meta.abstract_text);
-    std::string line;
-    while (std::getline(iss, line)) yaml << "  " << line << "\n";
-  }
-  yaml << "---\n\n";
+std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristics,
+                              const MetadataSpec& spec) {
+  const std::string yaml = render_frontmatter(dom.meta, spec) + "\n";
 
   std::ostringstream body;
   bool seen_refs = false;
@@ -159,7 +121,7 @@ std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristi
     }
   }
 
-  return yaml.str() + body.str();
+  return yaml + body.str();
 }
 
 }  // namespace agentpdf

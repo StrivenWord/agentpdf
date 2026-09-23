@@ -357,6 +357,9 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
       for (const char* weight : {"bold", "black", "heavy", "semibold", "demi"}) {
         if (font.find(weight) != std::string::npos) box.bold = true;
       }
+      for (const char* style : {"italic", "oblique"}) {
+        if (font.find(style) != std::string::npos) box.italic = true;
+      }
     }
     result.push_back(std::move(box));
   }
@@ -454,6 +457,8 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   // manuscript IDs, uploader account names).
   result.dom.info_title = collapse_ws(ustring_to_utf8(doc->get_title()));
   result.dom.info_author = collapse_ws(ustring_to_utf8(doc->get_author()));
+  result.dom.info_subject = collapse_ws(ustring_to_utf8(doc->get_subject()));
+  result.dom.info_keywords = collapse_ws(ustring_to_utf8(doc->get_keywords()));
 
   const int n = doc->pages();
   if (n <= 0) {

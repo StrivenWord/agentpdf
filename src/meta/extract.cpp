@@ -1,3 +1,4 @@
+#include "agentpdf/biblio.hpp"
 #include "agentpdf/frontmatter.hpp"
 #include "agentpdf/pdf.hpp"
 #include "agentpdf/util.hpp"
@@ -28,6 +29,7 @@ struct Row {
   double text_size = 0;           // size carrying most characters (drop caps ignored)
   bool bold = false;              // most characters set in a bold face
   bool marked = false;            // carries super/subscript glyphs (affiliation keys)
+  bool italic = false;            // most characters set in an italic face
   std::vector<Segment> segments;  // column-separated pieces, left to right
 };
 
@@ -43,10 +45,11 @@ bool excluded_region(RegionKind region) {
 // Group boxes into visual rows. Boxes smaller than `min_rel` of the row's
 // largest glyph (superscript affiliation marks, footnote symbols) are dropped
 // from the row text.
-std::vector<Row> rows_of(const std::vector<NormalizedTextBox>& boxes, double min_rel) {
+std::vector<Row> rows_of(const std::vector<NormalizedTextBox>& boxes, double min_rel,
+                         bool all_regions = false) {
   std::vector<const NormalizedTextBox*> sorted;
   for (const auto& b : boxes) {
-    if (!excluded_region(b.region) && b.rotation == 0) sorted.push_back(&b);
+    if ((all_regions || !excluded_region(b.region)) && b.rotation == 0) sorted.push_back(&b);
   }
   std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) {
     if (std::abs(a->box.y1 - b->box.y1) > 2.0) return a->box.y1 < b->box.y1;
@@ -103,12 +106,14 @@ std::vector<Row> rows_of(const std::vector<NormalizedTextBox>& boxes, double min
     row.box = group.front()->box;
     {
       std::vector<std::pair<double, size_t>> sized;
-      size_t chars = 0, bold_chars = 0;
+      size_t chars = 0, bold_chars = 0, italic_chars = 0;
       for (const auto* b : group) {
         sized.emplace_back(box_size(*b), b->text.size());
         chars += b->text.size();
         if (b->bold) bold_chars += b->text.size();
+        if (b->italic) italic_chars += b->text.size();
       }
+      row.italic = italic_chars * 2 > chars;
       std::sort(sized.begin(), sized.end());
       size_t acc = 0;
       for (const auto& [size, n] : sized) {
@@ -218,7 +223,9 @@ struct TitleBlock {
   BBox box;
   double size = 0;
   bool bold = false;
+  bool italic = false;
   bool found = false;
+  double gap = -1;  // leading between the first two title rows, once known
 };
 
 bool is_strong_byline(const Row& r, bool several_names_count);
@@ -277,6 +284,7 @@ TitleBlock text_layer_title(const std::vector<Row>& rows, double page_height) {
       tb.box = r.box;
       tb.size = r.text_size;
       tb.bold = r.bold;
+      tb.italic = r.italic;
       tb.found = true;
       continue;
     }
@@ -284,8 +292,15 @@ TitleBlock text_layer_title(const std::vector<Row>& rows, double page_height) {
     // byline (documents set entirely in one size separate title and names
     // only by weight or content).
     if (r.text_size < best - 0.6) break;
-    if (r.box.y0 - tb.box.y1 > best * 1.3) break;
-    if (r.bold != tb.bold) break;
+    const double gap = r.box.y0 - tb.box.y1;
+    if (gap > best * 1.3) break;
+    // A jump in leading starts a new block (a parallel title in a second
+    // language set in the same face, a subtitle block).
+    if (tb.gap >= 0 && gap > std::max(tb.gap * 1.8, tb.gap + 4.0)) break;
+    tb.gap = std::max(gap, 0.0);
+    // A change of weight or slant ends the title (parallel titles in a second
+    // language are usually set in italics).
+    if (r.bold != tb.bold || r.italic != tb.italic) break;
     if (is_strong_byline(r, false)) break;
     if (!tb.text.empty() && tb.text.back() == '-') tb.text += r.text;
     else tb.text += " " + r.text;
@@ -767,11 +782,53 @@ void extract_front_matter_metadata(DocumentDom& dom) {
   dom.meta.doi = front_matter_doi(dom);
 }
 
-void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*/) {
-  if (dom.meta.object_url.empty() && !dom.meta.doi.empty()) {
-    dom.meta.object_url = "https://doi.org/" + dom.meta.doi;
-  }
+namespace {
 
+// Journal-masthead candidates on the first content page: rows between
+// publisher furniture lines ("Contents lists available…" / "journal
+// homepage…"), rows with journal vocabulary, rows repeated in the page
+// furniture, and "Frontiers in …" footers. Best first.
+std::vector<std::string> masthead_candidates(const std::vector<Row>& rows, double page_height,
+                                             const std::string& title) {
+  std::vector<std::string> between, vocab, repeated, footer;
+  const auto folded_title = alnum_fold(title);
+  static const std::regex frontiers_footer(R"(^(Frontiers in [A-Z][A-Za-z,&' ]+?)(?:\s+\d+|\s+frontiersin\.org|$))");
+  for (size_t i = 0; i < rows.size(); ++i) {
+    for (const auto& seg : rows[i].segments) {
+      const auto text = collapse_ws(seg.text);
+      std::smatch m;
+      if (std::regex_search(text, m, frontiers_footer)) footer.push_back(trim(m[1]));
+    }
+    const auto& r = rows[i];
+    const bool band = r.box.y0 < page_height * 0.25 || r.box.y0 > page_height * 0.88;
+    if (!band || r.segments.size() > 1) continue;
+    const auto text = collapse_ws(r.text);
+    const auto words = split_words(text).size();
+    if (words == 0 || words > 15 || is_provenance_line(text) ||
+        text.find("http") != std::string::npos || text.find("www.") != std::string::npos)
+      continue;
+    if (!folded_title.empty() && alnum_fold(text) == folded_title) continue;
+    const auto digits = std::count_if(text.begin(), text.end(),
+                                      [](unsigned char c) { return std::isdigit(c); });
+    if (digits > 0) continue;
+    auto furniture = [&](size_t j) {
+      const auto low = to_lower(rows[j].text);
+      return low.find("contents lists available") != std::string::npos ||
+             low.find("journal homepage") != std::string::npos;
+    };
+    if (i > 0 && i + 1 < rows.size() && furniture(i - 1) && furniture(i + 1)) between.push_back(text);
+    else if (is_masthead_row(text)) vocab.push_back(text);
+    else if (is_masthead_in_context(rows, i, page_height)) repeated.push_back(text);
+  }
+  std::vector<std::string> out;
+  for (auto* group : {&between, &vocab, &repeated, &footer})
+    out.insert(out.end(), group->begin(), group->end());
+  return out;
+}
+
+}  // namespace
+
+void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*/) {
   // Abstract body: paragraph after an Abstract heading — require substantive prose.
   for (const auto& page : dom.pages) {
     bool after_abs = false;
@@ -815,8 +872,47 @@ void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*
   }
   if (dom.meta.keywords.empty()) dom.meta.keywords = keywords_from_geometry(dom);
 
-  if (dom.meta.date_extracted.empty()) dom.meta.date_extracted = today_iso_date();
-  if (dom.meta.source_format.empty()) dom.meta.source_format = "PDF";
+  // Evidence for the remaining bibliographic fields, all from this PDF.
+  BiblioEvidence ev;
+  ev.info_subject = decode_html_entities(dom.info_subject);
+  ev.info_keywords = decode_html_entities(dom.info_keywords);
+  bool masthead_done = false;
+  for (size_t p = 0; p < dom.front_boxes.size() && p < dom.pages.size(); ++p) {
+    const auto rows = rows_of(dom.front_boxes[p], 0.0, /*all_regions=*/true);
+    for (const auto& r : rows) {
+      std::string joined;
+      for (const auto& seg : r.segments) {
+        ev.front_lines.push_back(seg.text);
+        ev.front_rows.push_back(seg.text);
+        joined += (joined.empty() ? "" : " ") + seg.text;
+      }
+      if (r.segments.size() > 1) ev.front_lines.push_back(joined);
+    }
+    for (const auto& line : dom.pages[p].lines) ev.front_lines.push_back(line.text);
+    if (!masthead_done && !dom.pages[p].wrapper_page) {
+      ev.masthead_rows = masthead_candidates(rows, dom.pages[p].height, dom.meta.title);
+      masthead_done = true;
+    }
+  }
+  for (const auto& page : dom.pages) {
+    if (!page.wrapper_page) ++ev.content_pages;
+    for (const auto& line : page.lines) {
+      ev.all_lines.push_back(line.text);
+      ev.folded_full_text += alnum_fold(line.text) + ' ';
+    }
+    for (const auto& b : page.blocks) {
+      if (b.kind == BlockKind::Paragraph) ev.body_text += b.text + ' ';
+    }
+  }
+  extract_bibliographic(dom.meta, ev);
+
+  if (dom.meta.agentpdf_extracted.empty()) dom.meta.agentpdf_extracted = today_iso_date();
+#ifdef AGENTPDF_VERSION
+  if (dom.meta.agentpdf_version.empty()) dom.meta.agentpdf_version = AGENTPDF_VERSION;
+#endif
+  // Last: repair typographic damage and drop values that are still garbled
+  // or fail their field's syntax. A missing value is better than a wrong one.
+  sanitize_metadata(dom.meta);
 }
 
 }  // namespace agentpdf

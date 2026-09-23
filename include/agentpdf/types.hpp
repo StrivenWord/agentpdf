@@ -81,40 +81,67 @@ struct Heuristics {
   std::vector<PageOverride> page_overrides;
 };
 
-struct MetadataSpec {
-  std::vector<std::string> required_fields{
-      "title", "authors", "doi", "date-published", "source-format"};
-  std::vector<std::string> optional_fields{
-      "publisher",       "keywords",        "abstract",
-      "date-received",   "date-accepted",   "pages",
-      "type",            "object-url",      "published-formats",
-      "date-extracted",  "date-accessed"};
+// One canonical frontmatter field (see config/metadata.json and
+// documentation/metadata-fields.md). Keys are lowercase kebab-case, named
+// after the CSL variable Zotero exports the field to, or after the
+// Pandoc/Obsidian property for the same concept.
+struct FieldSpec {
+  std::string key;            // YAML property name
+  std::string obsidian_type;  // text | multitext | number | date | aliases | tags
+  std::string zotero;         // Zotero field ("—" when none)
+  std::string csl;            // CSL variable ("—" when none)
+  // Where a value can come from today: "pdf" (identifiable from the PDF),
+  // "agentpdf" (run provenance), "zotero" or "caller" (not available from a
+  // PDF: listed in the template but never emitted until such an input exists).
+  std::string source;
+  bool emitted() const { return source == "pdf" || source == "agentpdf"; }
 };
 
+struct MetadataSpec {
+  std::vector<FieldSpec> fields;  // output order
+  std::string origin = "built-in";
+};
+
+// Every value agentpdf can derive from a PDF. Empty strings, zero numbers and
+// empty lists mean "not found": such keys are omitted from the frontmatter.
 struct DocumentMeta {
   std::string title;
-  std::vector<std::string> authors;
+  std::string title_short;
+  std::vector<std::string> authors;       // "Given Family", as printed
+  std::string date;                       // ISO 8601 at known precision: YYYY[-MM[-DD]]
+  int year = 0;
+  std::string genre;                      // printed article type ("Original Research")
+  std::string container_title;
+  std::string container_title_short;
+  std::string publisher;
+  std::string volume;
+  std::string issue;
+  std::string page;                       // range "331-339" or article number
+  int number_of_pages = 0;
+  std::string language;                   // BCP 47 primary tag, detected from body text
+  std::string abstract_text;
+  std::vector<std::string> keywords;
+  std::string license;                    // canonical Creative Commons URL
   std::string doi;
-  std::string date_published;
+  std::vector<std::string> issn;
+  std::vector<std::string> isbn;
+  std::string arxiv;
+  std::string url;
+  std::string available_date;             // YYYY-MM-DD only
   std::string date_received;
   std::string date_accepted;
-  std::string date_extracted;
-  std::string date_accessed;
-  std::string publisher;
-  std::string source_format{"PDF"};
-  std::string published_formats{"PDF"};
-  std::string object_url;
-  std::string type;
-  std::string pages;
-  std::vector<std::string> keywords;
-  std::string abstract_text;
+  std::vector<std::string> aliases;
+  std::string agentpdf_extracted;
+  std::string agentpdf_version;
+  std::string agentpdf_source;
 };
 
 struct NormalizedTextBox {
   std::string text;
   BBox box;
   double font_size = 0;
-  bool bold = false;  // from the font name; only collected for front-matter evidence
+  bool bold = false;    // from the font name; only collected for front-matter evidence
+  bool italic = false;  // likewise
   int rotation = 0;
   int column = 0;
   RegionKind region = RegionKind::Body;
@@ -180,6 +207,8 @@ struct DocumentDom {
   // extraction cross-checks them against the text layer before use.
   std::string info_title;
   std::string info_author;
+  std::string info_subject;   // Elsevier/IEEE put a structured citation here
+  std::string info_keywords;
   // Front-matter evidence: every text box (all regions, font sizes included)
   // of the first pages, used only for metadata. Body classification keeps
   // using PageDom::normalized_boxes.

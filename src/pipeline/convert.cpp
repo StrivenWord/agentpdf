@@ -18,6 +18,7 @@ bool convert_document(const JobEntry& job, const Heuristics& heuristics,
   // Title/authors/DOI come from front-matter evidence first: body assembly
   // needs the title to recognise and drop the printed title block.
   extract_front_matter_metadata(dom);
+  dom.meta.agentpdf_source = job.filename;
   build_blocks_from_lines(dom, heuristics);
   isolate_footnotes(dom, heuristics);
   extract_and_validate_metadata(dom, meta_spec);
@@ -39,7 +40,7 @@ bool convert_document(const JobEntry& job, const Heuristics& heuristics,
   // Drop abstract paragraph duplicate from body if stored in YAML (keep heading).
   // Keep body abstract for ACM-style papers where handmade includes ABSTRACT section.
 
-  std::string md = assemble_markdown(dom, heuristics);
+  std::string md = assemble_markdown(dom, heuristics, meta_spec);
   if (!write_text_file(job.output_path, md, err)) return false;
   write_run_stats(dom, job, "run-reports");
   std::cerr << "wrote " << job.output_path << " (" << dom.pages.size() << " pages)\n";

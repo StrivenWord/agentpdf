@@ -37,12 +37,27 @@ std::string fold_lower(const std::string& s) {
       ++i;
       continue;
     }
+    // Latin Extended-A capitals are at even code points (Ğ C4 9E, Ş C5 9E, …).
+    if ((c == 0xC4 || c == 0xC5) && i + 1 < s.size()) {
+      auto d = static_cast<unsigned char>(s[i + 1]);
+      if (d >= 0x80 && d <= 0xBF && d % 2 == 0 && !(c == 0xC4 && d == 0xB0)) ++d;
+      out.push_back(static_cast<char>(c));
+      out.push_back(static_cast<char>(d));
+      ++i;
+      continue;
+    }
     out.push_back(static_cast<char>(c));
   }
   return out;
 }
 
 bool is_ascii_alpha(unsigned char c) { return std::isalpha(c) != 0; }
+
+}  // namespace
+
+std::string fold_lower_utf8(const std::string& text) { return fold_lower(text); }
+
+namespace {
 
 // Label vocabulary, longest first within each class so prefixes do not win.
 struct LabelSet {

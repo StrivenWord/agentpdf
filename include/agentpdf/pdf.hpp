@@ -53,7 +53,15 @@ void isolate_footnotes(DocumentDom& dom, const Heuristics& heuristics);
 // building because body assembly needs the title.
 void extract_front_matter_metadata(DocumentDom& dom);
 void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& spec);
-std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristics);
+std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristics,
+                              const MetadataSpec& spec);
+
+// Canonical frontmatter fields (src/meta/fields.cpp).
+MetadataSpec default_metadata_spec();
+bool parse_field_spec(const std::string& line, FieldSpec& out);
+// YAML frontmatter block for Obsidian: emitted fields only, in template
+// order, empty values omitted, text double-quoted, lists as block lists.
+std::string render_frontmatter(const DocumentMeta& meta, const MetadataSpec& spec);
 void write_run_stats(const DocumentDom& dom, const JobEntry& job, const std::string& report_dir);
 
 // Layout / OCR helpers

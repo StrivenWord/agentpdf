@@ -50,8 +50,16 @@ std::string normalize_typography(const std::string& s) {
     // UTF-8 multi-byte
     if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
       unsigned cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3F);
-      if (cp == 0x00A0) out.push_back(' ');  // nbsp
-      else {
+      if (cp == 0x00A0) {
+        out.push_back(' ');  // nbsp
+      } else if (cp == 0x00AD) {
+        // Soft hyphen: a discretionary line break. At the end of a line it
+        // behaves like a line-break hyphen (so line joining rejoins the word);
+        // anywhere else it is invisible and dropped.
+        size_t rest = i + 2;
+        while (rest < s.size() && (s[rest] == ' ' || s[rest] == '\t' || s[rest] == '\r')) ++rest;
+        if (rest >= s.size()) out.push_back('-');
+      } else {
         out.push_back(s[i]);
         out.push_back(s[i + 1]);
       }
@@ -67,8 +75,6 @@ std::string normalize_typography(const std::string& s) {
         out += " - ";  // en/em dash as spaced hyphen so words stay separate
       } else if (cp == 0x2026) {
         out += "...";
-      } else if (cp == 0x00AD) {
-        // soft hyphen: drop
       } else {
         out.push_back(s[i]);
         out.push_back(s[i + 1]);

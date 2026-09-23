@@ -1,4 +1,5 @@
 #include "agentpdf/config.hpp"
+#include "agentpdf/pdf.hpp"
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
@@ -268,11 +269,26 @@ bool load_heuristics(const std::string& path, Heuristics& out, std::string& err)
 }
 
 bool load_metadata_spec(const std::string& path, MetadataSpec& out, std::string& err) {
+  out = default_metadata_spec();
   std::map<std::string, std::string> scalars;
   std::map<std::string, std::vector<std::string>> arrays;
   if (!json_mini::parse_object_file(path, scalars, arrays, err)) return false;
-  if (auto it = arrays.find("required_fields"); it != arrays.end()) out.required_fields = it->second;
-  if (auto it = arrays.find("optional_fields"); it != arrays.end()) out.optional_fields = it->second;
+  auto it = arrays.find("fields");
+  if (it == arrays.end()) {
+    err = path + " has no \"fields\" template (old required/optional format?)";
+    return false;
+  }
+  MetadataSpec loaded;
+  loaded.origin = path;
+  for (const auto& line : it->second) {
+    FieldSpec field;
+    if (!parse_field_spec(line, field)) {
+      err = "invalid field descriptor in " + path + ": " + line;
+      return false;
+    }
+    loaded.fields.push_back(std::move(field));
+  }
+  out = std::move(loaded);
   return true;
 }
 
