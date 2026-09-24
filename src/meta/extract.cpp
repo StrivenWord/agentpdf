@@ -874,6 +874,10 @@ void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*
         }
         auto words = split_words(b.text);
         if (words.size() >= 40) {
+          // Plain text in the frontmatter: a bold run-in label's markup
+          // ("**Problem, research strategy, and findings:**") is the body's.
+          for (size_t at_mark = text.find("**"); at_mark != std::string::npos; at_mark = text.find("**", at_mark))
+            text.erase(at_mark, 2);
           dom.meta.abstract_text = text;
         }
         break;
