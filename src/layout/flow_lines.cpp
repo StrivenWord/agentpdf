@@ -89,6 +89,23 @@ bool same_row(const NormalizedTextBox& a, const NormalizedTextBox& b) {
   return b.box.x0 >= a.box.x0 - 0.5;
 }
 
+// The rest of a word in small capitals after its full-size capital: set
+// tight against it, in capitals of smaller type, on its baseline.
+bool small_caps_rest(const NormalizedTextBox& capital, const NormalizedTextBox& rest) {
+  if (capital.text.size() != 1 || !std::isupper(static_cast<unsigned char>(capital.text[0]))) return false;
+  if (rest.text.size() < 2 || capital.type_size <= 0 || rest.type_size <= 0) return false;
+  const double ratio = rest.type_size / capital.type_size;
+  if (ratio < 0.6 || ratio > 0.9) return false;
+  size_t letters = 0;
+  for (unsigned char c : rest.text) {
+    if (std::islower(c)) return false;
+    if (std::isupper(c)) ++letters;
+  }
+  if (letters < 2) return false;
+  const double gap = rest.box.x0 - capital.box.x1;
+  return gap > -0.5 && gap < 0.15 * capital.type_size && std::abs(rest.box.y1 - capital.box.y1) < 0.2 * capital.type_size;
+}
+
 // A lowered, smaller word set tight against the previous one: a chemical or
 // variable subscript ("O" + "3", "PM" + "2.5"), part of the same word.
 bool is_subscript_of(const NormalizedTextBox& base, const NormalizedTextBox& sub) {
@@ -284,6 +301,11 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
           // are note or citation markers, resolved once notes are known.
           sep.clear();
           marker = !notes && !any_region && !std::regex_search(prev.text, unit_before_exponent());
+        } else if (adjacent && small_caps_rest(prev, box)) {
+          // Small capitals: a word's capital set full size, its rest in
+          // smaller capitals ("I" + "NTRODUCTION"), one word however Poppler
+          // spaces them.
+          sep.clear();
         } else if (adjacent && !prev.space_after &&
                    box.box.x0 - prev.box.x1 < 0.15 * std::max(4.0, prev.type_size > 0 ? prev.type_size
                                                                                  : prev.box.height())) {

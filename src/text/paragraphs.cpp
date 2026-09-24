@@ -438,6 +438,19 @@ int heading_level_for(const std::string& text, const Heuristics& h, bool magazin
     return std::min(depth, 6);
   }
 
+  // Roman section numbers ("II. RELATED WORK", IEEE) over a title in
+  // capitals, and lettered subsections ("A. Embodied Footprint Estimation").
+  static const std::regex roman(R"(^(X{0,3}(?:IX|IV|V?I{0,3}))\.\s+(\S.*)$)");
+  if (std::regex_match(t, m, roman) && !m[1].str().empty() && capitals_line_ok(m[2].str())) {
+    cue = HeadingCue::Numbered;
+    return 1;
+  }
+  static const std::regex lettered(R"(^([A-H])\.\s+([A-Z][^.;:]*)$)");
+  if (std::regex_match(t, m, lettered) && split_words(m[2].str()).size() <= 10 && numbered_title_ok(m[2].str())) {
+    cue = HeadingCue::Numbered;
+    return 2;
+  }
+
   // Known unnumbered section titles of the Communications of the ACM
   // fixture; only meaningful inside that template.
   static const char* sections[] = {
@@ -482,6 +495,25 @@ bool typeset_heading_line(const TextLine& line, const std::string& text, const D
   if (has_math_notation(text) || looks_like_reference_entry(text) || is_figure_caption(text))
     return false;
   return !is_provenance_line(text) && !is_boilerplate_line(text);
+}
+
+// A line inside a block set wholly in one heavy or large type (a bold
+// abstract): four or more such lines in a row, closely set, are a paragraph
+// in that type, not headings.
+bool in_styled_block(const std::vector<TextLine>& lines, size_t i) {
+  const auto& line = lines[i];
+  auto same = [&](const TextLine& other) {
+    return other.has_geom && std::abs(other.font_size - line.font_size) < 0.3 && other.bold_all == line.bold_all &&
+           other.italic == line.italic;
+  };
+  size_t from = i, to = i;
+  while (from > 0 && same(lines[from - 1]) && lines[from].geom.y0 - lines[from - 1].geom.y1 < line.font_size * 0.8 &&
+         lines[from].geom.y0 > lines[from - 1].geom.y0)
+    --from;
+  while (to + 1 < lines.size() && same(lines[to + 1]) && lines[to + 1].geom.y0 - lines[to].geom.y1 < line.font_size * 0.8 &&
+         lines[to + 1].geom.y0 > lines[to].geom.y0)
+    ++to;
+  return to - from + 1 >= 4;
 }
 
 // Heading levels by style for headings without a section number: a style
@@ -559,7 +591,7 @@ std::map<HeadingStyle, int> heading_style_levels(const DocumentDom& dom, const H
         ++numbered[style_of(line, text)][level];
         styles.insert(style_of(line, text));
         ++uses[style_of(line, text)];
-      } else if (typeset_heading_line(line, text, dom)) {
+      } else if (typeset_heading_line(line, text, dom) && !in_styled_block(page.lines, li)) {
         // Pull quotes are set large but are not headings.
         size_t end = li;
         if (pull_quote_at(dom, page, li, end)) {
@@ -1192,16 +1224,18 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           page.index <= static_cast<int>(anchor.page) + 1) {
         continue;  // the title set again after a cover page
       }
+      // A pull quote: a sentence set large across several lines, repeating
+      // the text it was lifted from. It is not read twice.
       if (!references_seen && typeset_heading_line(line, text, dom)) {
-        // A pull quote: a sentence set large across several lines, repeating
-        // the text it was lifted from. It is not read twice.
-        {
-          size_t end = i;
-          if (pull_quote_at(dom, page, i, end)) {
-            i = end - 1;
-            continue;
-          }
+        size_t end = i;
+        if (pull_quote_at(dom, page, i, end)) {
+          i = end - 1;
+          continue;
         }
+      }
+      // A block set wholly in one heavy or large type is text in that type.
+      const bool styled_block = line.has_geom && in_styled_block(page.lines, i);
+      if (!references_seen && typeset_heading_line(line, text, dom) && !styled_block) {
         HeadingCue numbered_cue = HeadingCue::None;
         const bool numbered = heading_level_for(text, heuristics, false, numbered_cue) > 0 &&
                               numbered_cue != HeadingCue::Capitals;
@@ -1242,6 +1276,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       int hl = heading_level_for(text, heuristics,
                                  page.layout_family == LayoutFamily::MagazineTwoColumn, cue);
       if (hl > 0 && cue != HeadingCue::Label && !typeset_as_heading(line, text, dom)) hl = 0;
+      if (hl > 0 && cue == HeadingCue::Capitals && styled_block) hl = 0;
       if (hl > 0 && text.size() < 120 && glued_heading.empty()) {
         // Avoid classifying long paragraphs that merely start with a section phrase.
         auto low = to_lower(text);
