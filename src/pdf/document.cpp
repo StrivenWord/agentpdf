@@ -398,8 +398,14 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
         box.italic = true;
       // Heading faces also come as Medium (IEEE's NimbusRomNo9L-Medi) and
       // abbreviated Semibold (ArnoPro-Smbd).
+      // Also abbreviated Medium (ITCAvantGardeStd-Md, -MdObl).
+      const auto dash_md = font.rfind("-md");
+      const bool medium_abbrev =
+          dash_md != std::string::npos &&
+          (dash_md + 3 == font.size() || !std::isalpha(static_cast<unsigned char>(font[dash_md + 3])) ||
+           font.compare(dash_md + 3, 3, "obl") == 0 || font.compare(dash_md + 3, 2, "it") == 0);
       word.heavy = box.bold || font.find("medi") != std::string::npos ||
-                   font.find("smbd") != std::string::npos;
+                   font.find("smbd") != std::string::npos || medium_abbrev;
       word.italic = box.italic;
       word.font_size = box.font_size;
       box.type_size = word.font_size;

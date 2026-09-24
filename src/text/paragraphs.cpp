@@ -3,6 +3,8 @@
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <optional>
 #include <regex>
@@ -402,8 +404,9 @@ int heading_level_for(const std::string& text, const Heuristics& h, bool magazin
   // "Appendix", "Appendix A", "Appendix B. Technical data"; not prose that
   // opens with a reference to one ("Appendix A). Our tool…").
   static const std::regex appendix(R"(^(?:[Aa]ppendix|APPENDIX)(?:\s+[A-Z0-9]{1,3}(?:\.\d+)*[\.:]?(?:\s+\S.*)?)?$)");
-  if (low == "abstract" || low == "references" || low == "conclusion" ||
-      low == "acknowledgments" || low == "acknowledgements" ||
+  if (low == "abstract" || low == "references" || low == "conclusion" || low == "conclusions" ||
+      low == "acknowledgments" || low == "acknowledgements" || low == "acknowledgment" ||
+      low == "acknowledgement" ||
       (low.rfind("appendix", 0) == 0 && std::regex_match(t, appendix))) {
     return 1;
   }
@@ -505,10 +508,44 @@ bool title_fragment(const std::string& text, const DocumentDom& dom) {
   return folded.size() >= 12 && !title.empty() && title.find(folded) != std::string::npos;
 }
 
+// A pull quote: a sentence set large across several lines (from line i up
+// to end), repeating the text it was lifted from. It is not read twice.
+bool pull_quote_at(const DocumentDom& dom, const PageDom& page, size_t i, size_t& end) {
+  const auto& line = page.lines[i];
+  std::string quote = collapse_ws(normalize_typography(line.text));
+  size_t j = i + 1;
+  while (j < page.lines.size() && j < i + 6 && page.lines[j].has_geom &&
+         std::abs(page.lines[j].font_size - line.font_size) < 0.3 && page.lines[j].bold_all == line.bold_all) {
+    quote += " " + collapse_ws(normalize_typography(page.lines[j].text));
+    ++j;
+  }
+  const auto folded_quote = fold_alnum(quote);
+  if (j - i < 2 || folded_quote.size() < 40 || (!ends_sentence_like(quote) && folded_quote.size() < 60)) return false;
+  // Lifted, if not always word for word ("AI is widely regarded…" over
+  // "Artificial intelligence is widely regarded…"): a long run of it recurs.
+  std::string body_text;
+  for (const auto& other_page : dom.pages) {
+    for (size_t k = 0; k < other_page.lines.size(); ++k) {
+      if (&other_page == &page && k >= i && k < j) continue;
+      body_text += fold_alnum(other_page.lines[k].text);
+    }
+  }
+  size_t windows = 0, found = 0;
+  for (size_t at = 0; at + 40 <= folded_quote.size(); at += 8) {
+    ++windows;
+    if (body_text.find(folded_quote.substr(at, 40)) != std::string::npos) ++found;
+  }
+  if (windows == 0 || found * 10 < windows * 6) return false;
+  end = j;
+  return true;
+}
+
 std::map<HeadingStyle, int> heading_style_levels(const DocumentDom& dom, const Heuristics& h,
-                                                 size_t first_page, size_t first_line) {
+                                                 size_t first_page, size_t first_line,
+                                                 std::map<HeadingStyle, int>* uses_out = nullptr) {
   std::map<HeadingStyle, std::map<int, int>> numbered;
   std::set<HeadingStyle> styles;
+  std::map<HeadingStyle, int> uses;  // heading lines set in each style
   for (const auto& page : dom.pages) {
     if (page.wrapper_page || static_cast<size_t>(page.index) < first_page) continue;
     for (size_t li = 0; li < page.lines.size(); ++li) {
@@ -521,8 +558,29 @@ std::map<HeadingStyle, int> heading_style_levels(const DocumentDom& dom, const H
       if (level > 0 && cue == HeadingCue::Numbered && typeset_as_heading(line, text, dom)) {
         ++numbered[style_of(line, text)][level];
         styles.insert(style_of(line, text));
+        ++uses[style_of(line, text)];
       } else if (typeset_heading_line(line, text, dom)) {
+        // Pull quotes are set large but are not headings.
+        size_t end = li;
+        if (pull_quote_at(dom, page, li, end)) {
+          li = end - 1;
+          continue;
+        }
         styles.insert(style_of(line, text));
+        ++uses[style_of(line, text)];
+      }
+    }
+  }
+  if (std::getenv("AGENTPDF_DEBUG_HEADINGS")) {
+    for (const auto& page : dom.pages) {
+      if (page.wrapper_page || static_cast<size_t>(page.index) < first_page) continue;
+      for (size_t li = 0; li < page.lines.size(); ++li) {
+        const auto& line = page.lines[li];
+        const auto text = collapse_ws(normalize_typography(line.text));
+        if (text.empty() || !line.has_geom || title_fragment(text, dom)) continue;
+        if (!typeset_heading_line(line, text, dom)) continue;
+        const auto st = style_of(line, text);
+        std::fprintf(stderr, "HSTYLE size=%d caps=%d bold=%d |%.70s|\n", st.size, (int)st.caps, (int)st.bold, text.c_str());
       }
     }
   }
@@ -535,12 +593,15 @@ std::map<HeadingStyle, int> heading_style_levels(const DocumentDom& dom, const H
                       })->first;
       continue;
     }
+    // Ranked among the styles the document's headings recur in (a box
+    // title or a byline set once in a style of its own ranks nothing).
     int above = 0;
     for (const auto& other : styles) {
-      if (style < other) ++above;
+      if (style < other && uses[other] >= 3) ++above;
     }
-    levels[style] = std::min(3, above + 1);
+    levels[style] = std::min(4, above + 1);
   }
+  if (uses_out) *uses_out = uses;
   return levels;
 }
 
@@ -735,7 +796,13 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     }
   }
   const BodyAnchor anchor = find_body_anchor(dom);
-  const auto style_levels = heading_style_levels(dom, heuristics, anchor.page, anchor.line);
+  std::map<HeadingStyle, int> style_use_counts;
+  const auto style_levels =
+      heading_style_levels(dom, heuristics, anchor.page, anchor.line, &style_use_counts);
+  auto style_uses = [&](const std::map<HeadingStyle, int>&, const HeadingStyle& st) {
+    const auto it = style_use_counts.find(st);
+    return it == style_use_counts.end() ? 0 : it->second;
+  };
   std::vector<Block> pending_captions;
   bool body_started = false;
   bool frontiers_wait_for_intro = false;
@@ -1126,33 +1193,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         // A pull quote: a sentence set large across several lines, repeating
         // the text it was lifted from. It is not read twice.
         {
-          std::string quote = text;
-          size_t j = i + 1;
-          while (j < page.lines.size() && j < i + 6 && page.lines[j].has_geom &&
-                 std::abs(page.lines[j].font_size - line.font_size) < 0.3 &&
-                 page.lines[j].bold_all == line.bold_all) {
-            quote += " " + collapse_ws(normalize_typography(page.lines[j].text));
-            ++j;
-          }
-          const auto folded_quote = fold_alnum(quote);
-          if (j - i >= 2 && ends_sentence_like(quote) && folded_quote.size() >= 40) {
-            bool repeated = false;
-            for (const auto& other_page : dom.pages) {
-              std::string body_text;
-              for (size_t k = 0; k < other_page.lines.size(); ++k) {
-                if (&other_page == &page && k >= i && k < j) continue;
-                body_text += fold_alnum(other_page.lines[k].text);
-              }
-              if (body_text.find(folded_quote.substr(0, std::min<size_t>(folded_quote.size(), 60))) !=
-                  std::string::npos) {
-                repeated = true;
-                break;
-              }
-            }
-            if (repeated) {
-              i = j - 1;
-              continue;
-            }
+          size_t end = i;
+          if (pull_quote_at(dom, page, i, end)) {
+            i = end - 1;
+            continue;
           }
         }
         HeadingCue numbered_cue = HeadingCue::None;
@@ -1170,7 +1214,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           hb.heading_level = it != style_levels.end() ? it->second : 2;
           hb.text = text;
           const char last = text.back();
-          if (i + 1 < page.lines.size() && last != '.' && last != ':' && last != '?') {
+          if (i + 1 < page.lines.size() && last != '.' && last != '?') {
             const auto& next = page.lines[i + 1];
             const auto next_text = collapse_ws(normalize_typography(next.text));
             // The wrapped rest of the heading ("Resource adequacy and" /
@@ -1208,6 +1252,21 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           Block hb;
           hb.kind = BlockKind::Heading;
           hb.heading_level = hl;
+          // A section name set in the type of the document's other headings
+          // takes their level.
+          if (cue == HeadingCue::Label && line.has_geom) {
+            const auto it = style_levels.find(style_of(line, text));
+            if (it != style_levels.end()) hb.heading_level = it->second;
+            // Back matter set apart in a style of its own ("REFERENCES" in
+            // smaller capitals) is still a section: the top level.
+            if (it != style_levels.end() && style_uses(style_levels, it->first) < 3) {
+              int top_level = 99;
+              for (const auto& [st, lv] : style_levels) {
+                if (style_uses(style_levels, st) >= 3) top_level = std::min(top_level, lv);
+              }
+              if (top_level < 99) hb.heading_level = std::min(hb.heading_level, top_level);
+            }
+          }
           hb.text = text;
           hb.box = line.box;
           hb.page = page.index;

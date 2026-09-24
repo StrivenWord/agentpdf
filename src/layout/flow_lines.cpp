@@ -3,6 +3,8 @@
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
+#include <set>
+#include <functional>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -33,6 +35,16 @@ std::string word_key(const std::string& word) {
 bool ends_with_line_hyphen(const std::string& text) {
   return text.size() >= 2 && text.back() == '-' &&
          std::isalpha(static_cast<unsigned char>(text[text.size() - 2]));
+}
+
+// A list item's bullet: "•", "▪", "■", "◦", "➤", "►", "–" set apart.
+bool starts_with_bullet(const std::string& text) {
+  static const char* bullets[] = {"\xE2\x80\xA2", "\xE2\x96\xAA", "\xE2\x96\xA0", "\xE2\x97\xA6",
+                                  "\xE2\x9E\xA4", "\xE2\x96\xBA", "\xE2\x80\x93 ", "- "};
+  for (const char* b : bullets) {
+    if (text.rfind(b, 0) == 0) return true;
+  }
+  return false;
 }
 
 bool starts_lowercase(const std::string& text) {
@@ -457,7 +469,7 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
 // first, then right, each top to bottom.
 std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
                                              const std::vector<NormalizedTextBox>& boxes,
-                                             const std::vector<double>& gutters) {
+                                             const std::vector<double>& gutters, double body_size) {
   struct Placed {
     BBox box;
     int side = 0;  // -1 spanning, else the column's index left to right
@@ -505,8 +517,9 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
   std::vector<bool> used(columns.size(), false);
   std::vector<VisualLine> out;
   out.reserve(visual.size());
-  auto emit_band = [&](double limit) {
+  auto emit_band_to = [&](const std::function<double(int)>& limit_of) {
     for (int side = 0; side <= static_cast<int>(gutters.size()); ++side) {
+      const double limit = limit_of(side);
       std::vector<size_t> band;
       for (size_t c = 0; c < columns.size(); ++c) {
         if (!used[c] && columns[c].side == side && columns[c].box.cy() < limit) band.push_back(c);
@@ -518,6 +531,7 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
       }
     }
   };
+  auto emit_band = [&](double limit) { emit_band_to([limit](int) { return limit; }); };
   // Page text extent: a run of spanning lines that leaves room beside it
   // (an abstract set right of an article-info column, a caption beside a
   // column of text) reads as one block, with what stands beside it read
@@ -527,6 +541,7 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
     page_x0 = std::min(page_x0, p.box.x0);
     page_x1 = std::max(page_x1, p.box.x1);
   }
+  std::vector<size_t> deferred;  // floats read after the page's text
   for (size_t i = 0; i < spanning.size();) {
     // The block: spanning lines set closely one under another at one left
     // edge, with the short lines of its paragraphs that end before the
@@ -564,6 +579,39 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
       block.y1 = std::max(block.y1, last.y1);
     }
     const double em = std::max(4.0, spanning[i].box.height());
+    // A pull quote set into the columns' flow (large type across them, often
+    // centred, their text going on above and below it) interrupts none of
+    // them: it is read after the page's text.
+    if (body_size > 0) {
+      auto smallest_type = [&](size_t k) {
+        double smallest = 1e18;
+        for (size_t b : visual[spanning[k].index].boxes) {
+          if (boxes[b].type_size > 0) smallest = std::min(smallest, boxes[b].type_size);
+        }
+        return smallest;
+      };
+      const double size = smallest_type(i);
+      size_t q = i + 1;
+      BBox quote = spanning[i].box;
+      while (q < spanning.size() && std::abs(smallest_type(q) - size) <= 0.5 &&
+             spanning[q].box.y0 - spanning[q - 1].box.y1 <= std::max(4.0, spanning[q - 1].box.height())) {
+        quote.x0 = std::min(quote.x0, spanning[q].box.x0);
+        quote.x1 = std::max(quote.x1, spanning[q].box.x1);
+        quote.y1 = std::max(quote.y1, spanning[q].box.y1);
+        ++q;
+      }
+      bool above = false, below = false;
+      for (const auto& c : columns) {
+        if (std::min(c.box.x1, quote.x1) - std::max(c.box.x0, quote.x0) <= 0) continue;
+        if (c.box.y1 <= quote.y0 + 1.0) above = true;
+        if (c.box.y0 >= quote.y1 - 1.0) below = true;
+      }
+      if (q - i >= 3 && size < 1e17 && size >= 1.25 * body_size && above && below) {
+        for (size_t k = i; k < q; ++k) deferred.push_back(spanning[k].index);
+        i = q;
+        continue;
+      }
+    }
     const bool room = j - i >= 2 && (block.x0 > page_x0 + 3 * em || block.x1 < page_x1 - 3 * em);
     if (!room) {
       for (size_t k = i; k < j; ++k) {
@@ -596,12 +644,42 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
       i = j;
       continue;
     }
-    emit_band(top);
     std::vector<size_t> left, right;
     for (size_t c = 0; c < columns.size(); ++c) {
       if (beside(c, true)) left.push_back(c);
       else if (beside(c, false)) right.push_back(c);
     }
+    // A column that runs on past the block (its lines beside it continue
+    // those above it, and go on below it or to the page's end) is not
+    // interrupted: a float set into it (a caption beside a narrowed column)
+    // leaves its text to be read through.
+    auto flows_through = [&](std::vector<size_t> group) {
+      if (group.empty()) return false;
+      std::sort(group.begin(), group.end(), [&](size_t a, size_t b) { return by_y(columns[a], columns[b]); });
+      const auto& first = columns[group.front()].box;
+      const auto& last = columns[group.back()].box;
+      const int side = columns[group.front()].side;
+      const double lead = std::max(4.0, first.height());
+      bool above = false, below = false, more_below = false;
+      for (size_t c = 0; c < columns.size(); ++c) {
+        if (columns[c].side != side || std::find(group.begin(), group.end(), c) != group.end()) continue;
+        const auto& b = columns[c].box;
+        if (b.y1 <= first.y0 + 1.0 && first.y0 - b.y1 <= 1.5 * lead &&
+            std::min(b.x1, first.x1) - std::max(b.x0, first.x0) > 0)
+          above = true;
+        if (b.y0 >= last.y1 - 1.0) {
+          more_below = true;
+          if (b.y0 - last.y1 <= 2.5 * lead && std::min(b.x1, last.x1) - std::max(b.x0, last.x0) > 0) below = true;
+        }
+      }
+      return above && (below || !more_below);
+    };
+    std::set<int> through;
+    if (flows_through(left)) through.insert(columns[left.front()].side);
+    if (flows_through(right)) through.insert(columns[right.front()].side);
+    emit_band_to([&](int side) { return through.count(side) ? 1e18 : top; });
+    left.erase(std::remove_if(left.begin(), left.end(), [&](size_t c) { return used[c]; }), left.end());
+    right.erase(std::remove_if(right.begin(), right.end(), [&](size_t c) { return used[c]; }), right.end());
     auto emit_side = [&](std::vector<size_t>& side) {
       std::sort(side.begin(), side.end(), [&](size_t a, size_t b) { return by_y(columns[a], columns[b]); });
       for (size_t c : side) {
@@ -636,6 +714,7 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
     i = j;
   }
   emit_band(1e18);
+  for (size_t index : deferred) out.push_back(std::move(visual[index]));
   return out;
 }
 
@@ -835,6 +914,12 @@ void mark_paragraph_starts(std::vector<TextLine>& lines) {
       continue;
     }
     const auto& prev = lines[static_cast<size_t>(p)];
+    // A list item's text runs on under itself, indented past its bullet.
+    if (prev.has_geom && same_column(prev.geom, line.geom) && prev.geom.y0 < line.geom.y0 &&
+        starts_with_bullet(prev.text) && !starts_with_bullet(line.text)) {
+      const double step = line.geom.x0 - prev.geom.x0;
+      if (step >= 0.4 * em_of(line) && step <= 2.5 * em_of(line)) continue;
+    }
     // Read after a box set beside the text (keywords beside an abstract):
     // the text above in the line's own column decides.
     if (prev.has_geom && line.block_start && !same_column(prev.geom, line.geom)) {
@@ -986,6 +1071,21 @@ bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Voc
       if (!same_row(boxes[current.boxes.back()], boxes[k])) new_line = true;
       else if (known && current.flow_line >= 0 && flow_line_of[k] != current.flow_line)
         new_line = true;
+      // A caption beside a column of text shares no line with it, however
+      // close their baselines.
+      else if ((boxes[k].region == RegionKind::Caption) !=
+               (boxes[current.boxes.back()].region == RegionKind::Caption))
+        new_line = true;
+      // Nor do two columns: a gap across a gutter ends the line (Poppler can
+      // run a line on into the next column where their baselines agree).
+      else {
+        const auto& a = boxes[current.boxes.back()].box;
+        const auto& b = boxes[k].box;
+        const double em = std::max(4.0, boxes[k].type_size > 0 ? boxes[k].type_size : b.height() * 0.8);
+        for (double g : page.gutters) {
+          if (a.x1 <= g + 1.0 && b.x0 >= g - 1.0 && b.x0 - a.x1 >= 1.0 * em) new_line = true;
+        }
+      }
     }
     if (new_line) visual.push_back({});
     auto& current = visual.back();
@@ -999,7 +1099,8 @@ bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Voc
   // Two columns: read each band between full-width elements column by
   // column, top to bottom. Poppler's own order sometimes steps into the
   // next column early (a heading beside the text it follows).
-  if (!page.gutters.empty()) visual = column_reading_order(std::move(visual), boxes, page.gutters);
+  if (!page.gutters.empty())
+    visual = column_reading_order(std::move(visual), boxes, page.gutters, page.body_font_size);
 
   visual = merge_row_fragments(std::move(visual), boxes);
 

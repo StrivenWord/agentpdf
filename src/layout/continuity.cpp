@@ -1127,7 +1127,11 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     for (const auto& other : page.normalized_boxes) {
       if (&other == &label || !rows_overlap(label.box, other.box)) continue;
       if (columns.split && side >= 0 && side_of(columns, other.box) != side) continue;
-      if (other.box.x1 <= label.box.x0 + 0.5) text_before = true;
+      // A word set just before the label ("see Figure 3"); on a page set in
+      // columns, a column of text beside the caption, a gap away, is not.
+      const double em = std::max(4.0, label.type_size > 0 ? label.type_size : body);
+      if (other.box.x1 <= label.box.x0 + 0.5 && (!columns.split || label.box.x0 - other.box.x1 < 1.0 * em))
+        text_before = true;
       // "3", "3a.", "B.1", "A3:", "S2" (appendix and supplement numbering).
       static const std::regex number_word(R"(^(?:[A-Z]\.?)?\d+(?:\.\d+)?[A-Za-z]?[\.:|]?$)");
       if (!number && other.box.x0 >= label.box.x1 - 0.5 && other.box.x0 - label.box.x1 < 45 &&
@@ -1593,6 +1597,31 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
           line_start = next;
         }
       }
+      // A column of text can also stand to the left of such a figure: lines
+      // that end short of the caption's left edge, with a clear gap to it.
+      double bound_x0 = -1e18;
+      if (side < 0 && columns.split) {
+        const auto& first = boxes[seed].box;
+        const double em = std::max(4.0, boxes[seed].type_size > 0 ? boxes[seed].type_size : body);
+        const double edge = first.x0 - 0.5 * em;
+        std::vector<size_t> near;
+        for (size_t k = 0; k < boxes.size(); ++k) {
+          const auto& b = boxes[k];
+          if (b.rotation == 0 && std::abs(b.box.cy() - first.cy()) <= body * 8) near.push_back(k);
+        }
+        int beside_rows = 0;
+        bool crossed = false;
+        for (const auto& row : page_rows(page, near)) {
+          bool left = false;
+          for (size_t k : row.boxes) {
+            const auto& b = boxes[k].box;
+            if (b.x0 < edge && b.x1 > edge) crossed = true;
+            if (b.x1 <= first.x0 - 1.0 * em) left = true;
+          }
+          if (left) ++beside_rows;
+        }
+        if (!crossed && beside_rows >= 3) bound_x0 = edge;
+      }
       const auto seed_low = fold_lower_utf8(boxes[seed].text);
       const bool table_seed = seed_low.rfind("tab", 0) == 0 || seed_low.rfind("cuadro", 0) == 0 ||
                               seed_low.rfind("quadro", 0) == 0;
@@ -1765,7 +1794,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         if (columns.split && side >= 0 && other >= 0 && other != side) continue;
         if (columns.split && side < 0 &&
             (column_of(b.box.x1 - 1.0) < first_column || column_of(b.box.x0 + 1.0) > last_column ||
-             b.box.cx() > bound_x1))
+             b.box.cx() > bound_x1 || b.box.cx() < bound_x0))
           continue;
         members.push_back(k);
       }
