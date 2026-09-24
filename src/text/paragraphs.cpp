@@ -867,6 +867,11 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       if ((is_boilerplate_line(text) || is_provenance_line(text)) &&
           !(references_seen && reference_content(text)))
         continue;
+      // The journal's web toolbar on the opening page (ACS: "ACCESS | Metrics
+      // & More | Article Recommendations | sı Supporting Information"); the
+      // same words later head the article's associated content.
+      if (page.opening_page && (low == "s\xC4\xB1 supporting information" || low == "supporting information"))
+        continue;
       // Bylines set as a roster; never an entry of the reference list
       // ("Rydberg-Cox, J., Chavez, R., … and Crane, G.").
       if (page.layout_family == LayoutFamily::MagazineTwoColumn && !references_seen &&

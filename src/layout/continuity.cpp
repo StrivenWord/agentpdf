@@ -772,18 +772,55 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
       if (ba.y0 != bb.y0) return ba.y0 < bb.y0;
       return ba.x0 < bb.x0;
     });
-    std::vector<std::vector<size_t>> rows;
+    std::vector<std::vector<size_t>> grouped;
     double line_y = -1e9;
     bool row_top = false;
     for (size_t bi : band) {
       const auto& box = page.normalized_boxes[bi];
       const bool is_top = box.box.y1 <= top;
-      if (rows.empty() || std::abs(box.box.y0 - line_y) > 2.5 || row_top != is_top) {
-        rows.push_back({});
+      if (grouped.empty() || std::abs(box.box.y0 - line_y) > 2.5 || row_top != is_top) {
+        grouped.push_back({});
         line_y = box.box.y0;
         row_top = is_top;
       }
-      rows.back().push_back(bi);
+      grouped.back().push_back(bi);
+    }
+    // Lines printed over one another (a download stamp across a licence
+    // line): boxes of one row whose baselines differ and whose extents
+    // interleave are separate lines.
+    std::vector<std::vector<size_t>> rows;
+    for (auto& row : grouped) {
+      std::vector<std::vector<size_t>> clusters;
+      std::vector<double> cluster_y;
+      for (size_t bi : row) {  // sorted by y0
+        const double y0 = page.normalized_boxes[bi].box.y0;
+        if (clusters.empty() || y0 - cluster_y.back() > 1.0) {
+          clusters.push_back({});
+          cluster_y.push_back(y0);
+        }
+        clusters.back().push_back(bi);
+      }
+      auto span = [&](const std::vector<size_t>& c) {
+        double x0 = 1e18, x1 = -1e18;
+        for (size_t bi : c) {
+          x0 = std::min(x0, page.normalized_boxes[bi].box.x0);
+          x1 = std::max(x1, page.normalized_boxes[bi].box.x1);
+        }
+        return std::make_pair(x0, x1);
+      };
+      bool interleaved = false;
+      for (size_t a = 0; a < clusters.size() && !interleaved; ++a) {
+        for (size_t b = a + 1; b < clusters.size() && !interleaved; ++b) {
+          const auto sa = span(clusters[a]), sb = span(clusters[b]);
+          const double overlap = std::min(sa.second, sb.second) - std::max(sa.first, sb.first);
+          interleaved = overlap > 0.25 * std::min(sa.second - sa.first, sb.second - sb.first);
+        }
+      }
+      if (interleaved) {
+        for (auto& c : clusters) rows.push_back(std::move(c));
+      } else {
+        rows.push_back(std::move(row));
+      }
     }
     auto& parts = page_rows_parts[pi];
     auto& owner = part_row[pi];
@@ -824,7 +861,33 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
     const auto it = page_counts.find(signature);
     return it != page_counts.end() && it->second >= needed;
   };
-  auto furniture = [&](const std::string& text) { return is_folio_line(text) || is_band_furniture_line(text); };
+  // Letter-spaced capitals ("P U B L I S H E D  BY  T H E …") read as words.
+  auto unspaced = [](const std::string& text) {
+    std::vector<std::string> words;
+    std::string cur;
+    for (char c : text + " ") {
+      if (c == ' ') {
+        if (!cur.empty()) words.push_back(cur);
+        cur.clear();
+      } else {
+        cur.push_back(c);
+      }
+    }
+    size_t single = 0;
+    for (const auto& w : words) single += w.size() == 1 ? 1 : 0;
+    if (words.size() < 6 || single * 2 < words.size()) return text;
+    std::string out;
+    for (size_t i = 0; i < words.size(); ++i) {
+      const bool glue = i > 0 && words[i].size() == 1 && words[i - 1].size() == 1;
+      if (i > 0 && !glue) out.push_back(' ');
+      out += words[i];
+    }
+    return out;
+  };
+  auto furniture = [&](const std::string& text) {
+    const auto t = unspaced(text);
+    return is_folio_line(t) || is_band_furniture_line(t);
+  };
   auto extent = [](const PageDom& page, const std::vector<size_t>& boxes) {
     BBox b = page.normalized_boxes[boxes.front()].box;
     for (size_t bi : boxes) {
