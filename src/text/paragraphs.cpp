@@ -839,8 +839,23 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           low.find("last 36 months") != std::string::npos) {
         continue;
       }
-      if (is_boilerplate_line(text) || is_provenance_line(text)) continue;
-      if (page.layout_family == LayoutFamily::MagazineTwoColumn &&
+      // A reference list's own lines (a DOI or URL wrapped onto its own
+      // line, "Available online: …", "(accessed on …)") are its text, not
+      // provenance furniture.
+      auto reference_content = [](const std::string& t) {
+        const auto l = to_lower(trim(t));
+        for (const char* start : {"http", "doi", "www.", "dx.doi", "available online", "available at",
+                                  "(accessed", "accessed", "retrieved from"}) {
+          if (l.rfind(start, 0) == 0) return true;
+        }
+        return false;
+      };
+      if ((is_boilerplate_line(text) || is_provenance_line(text)) &&
+          !(references_seen && reference_content(text)))
+        continue;
+      // Bylines set as a roster; never an entry of the reference list
+      // ("Rydberg-Cox, J., Chavez, R., … and Crane, G.").
+      if (page.layout_family == LayoutFamily::MagazineTwoColumn && !references_seen &&
           is_author_roster_line(text))
         continue;
 
@@ -1149,8 +1164,13 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
 
       // Numbered bibliography entries and list items each open a paragraph
-      // (Markdown reads a run of them as an ordered list).
+      // (Markdown reads a run of them as an ordered list), and so does each
+      // author biography after the references ("Gregory Crane
+      // (gcrane@…) is a professor…").
+      static const std::regex biography(
+          R"(^[A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)*(?:\s+[A-Z][A-Za-z'\-]+)+\s+\([^)\s]+@[^)\s]+\)\s)");
       if ((references_seen && is_bibliography_entry_start(text)) ||
+          (references_seen && std::regex_search(text, biography)) ||
           is_list_item_start(text, cur.text)) {
         flush();
         cur.kind = BlockKind::Paragraph;
@@ -1203,11 +1223,21 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         cur.box = line.box;
         cur.page = page.index;
       } else {
-        // Join without space only for soft hyphens at end of line.
+        // Join without space only for soft hyphens at end of line, and
+        // inside a URL broken after a slash ("www.ariadne.ac.uk/" +
+        // "issue25/mueller").
+        const auto last_token = cur.text.substr(cur.text.find_last_of(' ') == std::string::npos
+                                                    ? 0
+                                                    : cur.text.find_last_of(' ') + 1);
+        const bool url_break = !cur.text.empty() && cur.text.back() == '/' &&
+                               (last_token.find("www.") != std::string::npos ||
+                                last_token.find("http") != std::string::npos);
         if (!cur.text.empty() && cur.text.back() == '-' && !text.empty() &&
             std::islower(static_cast<unsigned char>(text.front()))) {
           // Soft hyphen continuation: remove hyphen and join directly.
           cur.text.pop_back();
+        } else if (url_break) {
+          // The URL continues on this line.
         } else if (!cur.text.empty() && !text.empty()) {
           // Normal case: add space between text.
           cur.text.push_back(' ');
