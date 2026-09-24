@@ -838,6 +838,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
 
     bool first_line_of_page = true;
     bool after_equation = false;
+    bool page_text_started = false;
     const TextLine* last_caption_line = nullptr;
     for (size_t i = 0; i < page.lines.size(); ++i) {
       const auto& line = page.lines[i];
@@ -1015,7 +1016,9 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           caption.page = page.index;
           pending_captions.push_back(std::move(caption));
         }
-        if (cur.text.empty()) release_captions();
+        // Released between paragraphs; before the page's own text begins,
+        // the previous page's paragraph may still be running on.
+        if (cur.text.empty() && page_text_started) release_captions();
         continue;
       }
 
@@ -1401,6 +1404,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         }
       }
       if (cur.text.empty()) {
+        page_text_started = true;
         cur.kind = BlockKind::Paragraph;
         cur.text = text;
         cur.box = line.box;

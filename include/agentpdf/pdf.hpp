@@ -86,12 +86,13 @@ struct LineColumns {
   std::vector<double> left, right;
   std::vector<bool> justified;
 };
-LineColumns measure_line_columns(const std::vector<TextLine>& lines);
+LineColumns measure_line_columns(const std::vector<TextLine>& lines,
+                                 const std::vector<double>& gutters = {});
 // Paragraph starts from page geometry (TextLine::para_start).
-void mark_paragraph_starts(std::vector<TextLine>& lines);
+void mark_paragraph_starts(std::vector<TextLine>& lines, const std::vector<double>& gutters = {});
 // A display equation's lines (set off from the text, carrying mathematics
 // or an equation number) as one line of its own (TextLine::equation).
-void group_display_equations(std::vector<TextLine>& lines);
+void group_display_equations(std::vector<TextLine>& lines, const std::vector<double>& gutters = {});
 // A page's first line opens a paragraph when the previous page's last line
 // stopped short after a finished sentence.
 void mark_page_turn_paragraphs(std::vector<PageDom>& pages);

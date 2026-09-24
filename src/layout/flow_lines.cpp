@@ -7,6 +7,8 @@
 #include <functional>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <regex>
 
@@ -536,11 +538,22 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
   // (an abstract set right of an article-info column, a caption beside a
   // column of text) reads as one block, with what stands beside it read
   // apart: to its left before it, to its right after it.
+  // Rotated lines (a download stamp up the margin) have no place in it.
+  auto rotated = [&](const Placed& p) { return boxes[visual[p.index].boxes.front()].rotation != 0; };
   double page_x0 = 1e18, page_x1 = -1e18;
   for (const auto& p : placed) {
+    if (rotated(p)) continue;
     page_x0 = std::min(page_x0, p.box.x0);
     page_x1 = std::max(page_x1, p.box.x1);
   }
+  // A line's type: the smallest size among its words.
+  auto type_of = [&](const Placed& p) {
+    double size = 1e18;
+    for (size_t b : visual[p.index].boxes) {
+      if (boxes[b].type_size > 0) size = std::min(size, boxes[b].type_size);
+    }
+    return size;
+  };
   std::vector<size_t> deferred;  // floats read after the page's text
   for (size_t i = 0; i < spanning.size();) {
     // The block: spanning lines set closely one under another at one left
@@ -557,9 +570,12 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
                std::abs(next.x0 - block.x0) <= lead * 1.5;
       };
       long column_line = -1;
+      const double block_type = type_of(spanning[i]);
       for (size_t c = 0; c < columns.size(); ++c) {
         const auto& b = columns[c].box;
-        if (used[c] || !continues(b) || b.x1 > block.x1 + 2.0) continue;
+        if (used[c] || rotated(columns[c]) || !continues(b) || b.x1 > block.x1 + 2.0) continue;
+        // In the block's own type: the text under a caption is not the caption.
+        if (block_type < 1e17 && std::abs(type_of(columns[c]) - block_type) > 0.5) continue;
         if (std::find(absorbed.begin(), absorbed.end(), c) != absorbed.end()) continue;
         if (column_line < 0 || b.y0 < columns[static_cast<size_t>(column_line)].box.y0) column_line = static_cast<long>(c);
       }
@@ -631,7 +647,8 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
     const double top = label >= 0 ? columns[static_cast<size_t>(label)].box.y0 : block.y0;
     auto beside = [&](size_t c, bool to_left) {
       const auto& b = columns[c].box;
-      if (used[c] || static_cast<long>(c) == label || b.cy() < top || b.y0 > block.y1) return false;
+      if (used[c] || rotated(columns[c]) || static_cast<long>(c) == label || b.cy() < top || b.y0 > block.y1)
+        return false;
       return to_left ? b.x1 < block.x0 - 2.0 : b.x0 > block.x1 + 2.0;
     };
     bool any_beside = false;
@@ -677,6 +694,11 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
     std::set<int> through;
     if (flows_through(left)) through.insert(columns[left.front()].side);
     if (flows_through(right)) through.insert(columns[right.front()].side);
+    if (std::getenv("AGENTPDF_DEBUG_ORDER")) {
+      std::fprintf(stderr, "ORDER block y=%.1f-%.1f x=%.1f-%.1f lines=%zu absorbed=%zu left=%zu right=%zu through=%zu\n",
+                   block.y0, block.y1, block.x0, block.x1, j - i, absorbed.size(), left.size(), right.size(),
+                   through.size());
+    }
     emit_band_to([&](int side) { return through.count(side) ? 1e18 : top; });
     left.erase(std::remove_if(left.begin(), left.end(), [&](size_t c) { return used[c]; }), left.end());
     right.erase(std::remove_if(right.begin(), right.end(), [&](size_t c) { return used[c]; }), right.end());
@@ -770,16 +792,30 @@ std::vector<VisualLine> merge_row_fragments(std::vector<VisualLine> visual,
 
 }  // namespace
 
-LineColumns measure_line_columns(const std::vector<TextLine>& lines) {
+LineColumns measure_line_columns(const std::vector<TextLine>& lines, const std::vector<double>& gutters) {
   LineColumns cols;
   const size_t n = lines.size();
   cols.left.assign(n, 0);
   cols.right.assign(n, 0);
   cols.justified.assign(n, false);
+  // On a page set in columns a line's mates are the lines of its column (a
+  // full-width abstract above overlaps a column but is not in it).
+  auto side_of_line = [&](const BBox& b) {
+    int column = 0;
+    for (double g : gutters) {
+      if (b.x1 <= g + 1.0) return column;
+      if (b.x0 < g - 1.0) return -1;
+      ++column;
+    }
+    return column;
+  };
+  std::vector<int> sides(n, 0);
+  for (size_t i = 0; i < n; ++i) sides[i] = gutters.empty() ? 0 : side_of_line(lines[i].geom);
   for (size_t i = 0; i < n; ++i) {
     std::vector<double> left, right;
     for (size_t j = 0; j < n; ++j) {
       if (!lines[j].has_geom || lines[j].caption || !same_column(lines[i].geom, lines[j].geom)) continue;
+      if (!gutters.empty() && sides[j] != sides[i]) continue;
       left.push_back(lines[j].geom.x0);
       right.push_back(lines[j].geom.x1);
     }
@@ -805,12 +841,15 @@ bool line_is_short(const TextLine& line, const LineColumns& cols, size_t i) {
   return cols.justified[i] && line.geom.x1 < cols.right[i] - 1.5 * em_of(line);
 }
 
-void group_display_equations(std::vector<TextLine>& lines) {
+void group_display_equations(std::vector<TextLine>& lines, const std::vector<double>& gutters) {
   if (lines.size() < 2) return;
-  const auto cols = measure_line_columns(lines);
+  const auto cols = measure_line_columns(lines, gutters);
   static const std::regex equation_number(R"(^\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)$)");
   static const std::regex trailing_number(R"(\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)$)");
-  auto math_notation = [](const std::string& t) {
+  auto math_notation = [](const std::string& raw) {
+    // A minus sign between two letters is a dash ("spatial−temporal").
+    static const std::regex worded_minus(R"(([A-Za-z])\xE2\x88\x92([A-Za-z]))");
+    const auto t = std::regex_replace(raw, worded_minus, "$1-$2");
     if (t.find_first_of("=<>^_|") != std::string::npos) return true;
     for (const char* op : {"\xE2\x88\x91", "\xE2\x88\x8F", "\xE2\x88\xAB", "\xC2\xB1", "\xC3\x97",
                            "\xE2\x88\x92", "\xE2\x89\xA4", "\xE2\x89\xA5", "\xE2\x88\x88", "\xE2\x88\x80",
@@ -871,8 +910,8 @@ void group_display_equations(std::vector<TextLine>& lines) {
   renumber_synthetic_line_y(lines);
 }
 
-void mark_paragraph_starts(std::vector<TextLine>& lines) {
-  const auto cols = measure_line_columns(lines);
+void mark_paragraph_starts(std::vector<TextLine>& lines, const std::vector<double>& gutters) {
+  const auto cols = measure_line_columns(lines, gutters);
   auto indent_of = [&](size_t i) { return lines[i].geom.x0 - cols.left[i]; };
   auto indented = [&](size_t i) {
     const double em = em_of(lines[i]);
@@ -1105,8 +1144,8 @@ bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Voc
   visual = merge_row_fragments(std::move(visual), boxes);
 
   out = region_lines(visual, boxes, RegionKind::Body, vocab);
-  group_display_equations(out);
-  mark_paragraph_starts(out);
+  group_display_equations(out, page.gutters);
+  mark_paragraph_starts(out, page.gutters);
   if (notes) *notes = region_lines(visual, boxes, RegionKind::Footnote, vocab);
   if (evidence) {
     evidence->clear();
