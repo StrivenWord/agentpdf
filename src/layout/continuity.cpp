@@ -1476,11 +1476,29 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     }
     auto key_text = [](const std::string& text) {
       if (is_digits(text)) return text.size() <= 2;
+      // "2." at a note's head, in the notes' own type (numbered notes).
+      if (text.size() >= 2 && text.size() <= 3 && text.back() == '.' && is_digits(text.substr(0, text.size() - 1)))
+        return true;
       return text == "*" || text == "**" || text == "\xE2\x80\xA0" || text == "\xE2\x80\xA1" ||
              text == "\xC2\xA7" || text == "\xC2\xB6" || text == "\xE2\x88\x97";  // † ‡ § ¶ ∗
     };
+    // Note markers on the page: small digits raised against the word they
+    // follow. A numbered key with a period ("2.") names a note only when
+    // the page carries its marker (a reference list's entries are numbered
+    // alike, with no markers).
+    std::set<std::string> page_markers;
+    for (size_t k = 1; k < page.normalized_boxes.size(); ++k) {
+      const auto& m = page.normalized_boxes[k];
+      const auto& before = page.normalized_boxes[k - 1];
+      if (!is_digits(m.text) || m.text.size() > 3 || m.type_size <= 0 || before.type_size <= 0) continue;
+      if (m.type_size > before.type_size * 0.85) continue;
+      if (m.box.x0 < before.box.x1 - 0.5 || m.box.x0 - before.box.x1 > 2.0) continue;
+      if (m.box.cy() >= before.box.cy() - before.box.height() * 0.1) continue;
+      page_markers.insert(m.text);
+    }
     for (const auto& key : page.normalized_boxes) {
       if (!key_text(key.text)) continue;
+      if (key.text.back() == '.' && !page_markers.count(key.text.substr(0, key.text.size() - 1))) continue;
       if (key.box.y0 < page.height * 0.60 || key.box.y1 > bottom) continue;
       const int side = side_of(columns, key.box);
       if (side < 0 || key.box.x0 > col_left[static_cast<size_t>(side)] + 1.5 * body) continue;

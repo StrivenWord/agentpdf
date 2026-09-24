@@ -257,7 +257,16 @@ bool note_key_text(const std::string& text) {
     return text == "\xE2\x80\xA0" || text == "\xE2\x80\xA1" || text == "\xC2\xA7";  // † ‡ §
   }
   if (text == "*" || text == "**") return true;
-  return std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c); });
+  // "2." heads a numbered note.
+  const size_t digits = text.back() == '.' ? text.size() - 1 : text.size();
+  return digits > 0 && std::all_of(text.begin(), text.begin() + static_cast<long>(digits),
+                                   [](unsigned char c) { return std::isdigit(c); });
+}
+
+// A note's key as its markers name it ("2." is note 2).
+std::string note_key_name(const std::string& text) {
+  if (text.size() >= 2 && text.back() == '.') return text.substr(0, text.size() - 1);
+  return text;
 }
 
 // The words of one region (running text, or footnotes) as lines with their
@@ -295,7 +304,7 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
       const bool smaller = key.type_size > 0 && next.type_size > 0 && key.type_size < next.type_size * 0.9;
       const bool raised = key.box.cy() < next.box.cy() - next.box.height() * 0.1;
       if (smaller || raised || key.box.x1 <= next.box.x0) {
-        line.note_key = key.text;
+        line.note_key = note_key_name(key.text);
         begin = 1;
       }
     }
@@ -432,7 +441,7 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
       auto& next = out[i + 1];
       if (!key.note_key.empty() || !next.note_key.empty() || !note_key_text(key.text)) continue;
       if (key.geom.y1 < next.geom.y0 - 2.0 || key.geom.x0 > next.geom.x0 + 1.0) continue;
-      next.note_key = key.text;
+      next.note_key = note_key_name(key.text);
       key.text.clear();
     }
   }
