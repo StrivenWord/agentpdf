@@ -821,6 +821,37 @@ BodyAnchor find_body_anchor(const DocumentDom& dom) {
 
 }  // namespace
 
+// A caption goes in between paragraphs, followed by the table it carries
+// and that table's notes.
+void emit_caption(std::vector<Block>& blocks, Block caption, DocumentDom& dom) {
+  auto rows = std::move(caption.table_rows);
+  auto notes = std::move(caption.table_notes);
+  caption.table_rows.clear();
+  caption.table_notes.clear();
+  const int page = caption.page;
+  const BBox box = caption.box;
+  blocks.push_back(std::move(caption));
+  ++dom.figure_count;
+  if (!rows.empty()) {
+    Block table;
+    table.kind = BlockKind::Table;
+    table.table_rows = std::move(rows);
+    table.page = page;
+    table.box = box;
+    blocks.push_back(std::move(table));
+    ++dom.table_count;
+  }
+  for (auto& note : notes) {
+    Block paragraph;
+    paragraph.kind = BlockKind::Paragraph;
+    paragraph.text = collapse_ws(normalize_typography(note));
+    paragraph.page = page;
+    paragraph.box = box;
+    paragraph.entry_start = true;
+    blocks.push_back(std::move(paragraph));
+  }
+}
+
 void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
   if (heuristics.rejoin_hyphenation) {
     for (auto& page : dom.pages) {
@@ -862,8 +893,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     auto release_captions = [&] {
       for (auto& c : pending_captions) {
         c.page = page.index;
-        page.blocks.push_back(std::move(c));
-        ++dom.figure_count;
+        emit_caption(page.blocks, std::move(c), dom);
       }
       pending_captions.clear();
     };
@@ -1046,6 +1076,18 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           caption.text = text;
           caption.box = line.box;
           caption.page = page.index;
+          // A table's caption carries its grid (read with its island).
+          if (line.has_geom) {
+            for (const auto& grid : page.tables) {
+              const auto& l = grid.label;
+              if (l.cy() >= line.geom.y0 - 1.0 && l.cy() <= line.geom.y1 + 1.0 && l.cx() >= line.geom.x0 - 1.0 &&
+                  l.cx() <= line.geom.x1 + 1.0) {
+                caption.table_rows = grid.rows;
+                caption.table_notes = grid.notes;
+                break;
+              }
+            }
+          }
           pending_captions.push_back(std::move(caption));
         }
         // Released between paragraphs; before the page's own text begins,
@@ -1493,8 +1535,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       if (page->wrapper_page) continue;
       for (auto& c : pending_captions) {
         c.page = page->index;
-        page->blocks.push_back(std::move(c));
-        ++dom.figure_count;
+        emit_caption(page->blocks, std::move(c), dom);
       }
       pending_captions.clear();
       break;

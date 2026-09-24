@@ -230,6 +230,16 @@ struct Block {
   bool para_start = false;
   bool continues = false;
   std::vector<std::vector<std::string>> table_rows;
+  std::vector<std::string> table_notes;  // a caption's table: the notes under it
+};
+
+// A table read from its island on a typed page: rows of cells, set by the
+// caption label's box so that the caption can carry it, and the notes set
+// under it.
+struct TableGrid {
+  BBox label;
+  std::vector<std::vector<std::string>> rows;
+  std::vector<std::string> notes;
 };
 
 struct PageDom {
@@ -239,6 +249,7 @@ struct PageDom {
   bool used_ocr = false;
   bool wrapper_page = false;
   bool opening_page = false;  // the first page that is not a wrapper (a cover)
+  std::vector<TableGrid> tables;  // typed pages: tables read from their islands
   bool keep_captions = false;
   bool has_region_overrides = false;
   LayoutFamily layout_family = LayoutFamily::Generic;

@@ -40,21 +40,44 @@ std::string heading_prefix(int level) {
   return std::string(static_cast<size_t>(level), '#') + " ";
 }
 
-std::string pad_table(const std::vector<std::vector<std::string>>& rows) {
-  if (rows.empty()) return {};
+// Display width of a cell: its characters, not its bytes (UTF-8).
+size_t cell_width(const std::string& s) {
+  size_t n = 0;
+  for (unsigned char c : s) n += (c & 0xC0) != 0x80 ? 1 : 0;
+  return n;
+}
+
+// A cell's text in a table row: pipes escaped, spacing collapsed.
+std::string table_cell(const std::string& raw) {
+  std::string out;
+  for (char c : collapse_ws(raw)) {
+    if (c == '|') out += "\\|";
+    else out.push_back(c);
+  }
+  return out;
+}
+
+std::string pad_table(const std::vector<std::vector<std::string>>& raw_rows) {
+  if (raw_rows.empty()) return {};
+  std::vector<std::vector<std::string>> rows;
+  for (const auto& r : raw_rows) {
+    std::vector<std::string> cells;
+    for (const auto& c : r) cells.push_back(table_cell(c));
+    rows.push_back(std::move(cells));
+  }
   size_t cols = 0;
   for (const auto& r : rows) cols = std::max(cols, r.size());
   std::vector<size_t> widths(cols, 0);
   for (const auto& r : rows) {
-    for (size_t c = 0; c < r.size(); ++c) widths[c] = std::max(widths[c], r[c].size());
+    for (size_t c = 0; c < r.size(); ++c) widths[c] = std::max(widths[c], cell_width(r[c]));
   }
   auto fmt_row = [&](const std::vector<std::string>& r) {
     std::ostringstream oss;
     oss << "|";
     for (size_t c = 0; c < cols; ++c) {
       std::string cell = c < r.size() ? r[c] : "";
-      oss << " " << cell << std::string(widths[c] > cell.size() ? widths[c] - cell.size() : 0, ' ')
-          << " |";
+      const size_t w = cell_width(cell);
+      oss << " " << cell << std::string(widths[c] > w ? widths[c] - w : 0, ' ') << " |";
     }
     return oss.str();
   };

@@ -616,6 +616,266 @@ bool aligned_rows(const PageDom& page, const PageRow& upper, const PageRow& lowe
   return aligned >= 2 || (aligned == 1 && lower.boxes.size() <= 6);
 }
 
+// A table's grid from the rows of its island (top to bottom): cells are
+// runs of words set apart by more than a word space; columns are the bands
+// the fullest rows' cells occupy; a row that only carries on some cells'
+// text (a wrapped cell) joins the row above; full-width rows under the body
+// are the table's notes.
+TableGrid table_grid(const PageDom& page, const std::vector<PageRow>& rows, const std::vector<size_t>& body,
+                     double body_size) {
+  TableGrid grid;
+  struct Cell {
+    double x0 = 0, x1 = 0;
+    std::string text;
+  };
+  const auto& boxes = page.normalized_boxes;
+  // A cell's words line by line, left to right on each (a row can hold a
+  // cell wrapped onto two lines beside one set between them).
+  auto cell_text = [&](std::vector<size_t> members) {
+    // Lines by baseline, the largest type deciding: a raised or lowered
+    // index belongs to the line it is set against.
+    std::sort(members.begin(), members.end(), [&](size_t a, size_t b) { return boxes[a].box.cy() < boxes[b].box.cy(); });
+    std::vector<std::vector<size_t>> lines;
+    std::vector<std::pair<double, double>> extent;  // each line's y range
+    for (size_t k : members) {
+      const auto& b = boxes[k].box;
+      bool placed = false;
+      for (size_t l = 0; l < lines.size() && !placed; ++l) {
+        const double overlap = std::min(extent[l].second, b.y1) - std::max(extent[l].first, b.y0);
+        if (overlap >= 0.5 * std::min(b.height(), extent[l].second - extent[l].first)) {
+          lines[l].push_back(k);
+          extent[l].first = std::min(extent[l].first, b.y0);
+          extent[l].second = std::max(extent[l].second, b.y1);
+          placed = true;
+        }
+      }
+      if (!placed) {
+        lines.push_back({k});
+        extent.push_back({b.y0, b.y1});
+      }
+    }
+    std::string text;
+    for (auto& line : lines) {
+      std::sort(line.begin(), line.end(), [&](size_t a, size_t b) { return boxes[a].box.x0 < boxes[b].box.x0; });
+      const NormalizedTextBox* prev = nullptr;
+      for (size_t k : line) {
+        const auto& b = boxes[k];
+        if (!text.empty()) {
+          const double em = std::max(4.0, b.type_size > 0 ? b.type_size : body_size);
+          const bool touching = prev && !prev->space_after && b.box.x0 - prev->box.x1 < 0.15 * em;
+          const bool line_hyphen = !prev && text.size() >= 2 && text.back() == '-' &&
+                                   std::isalpha(static_cast<unsigned char>(text[text.size() - 2]));
+          const auto next = static_cast<unsigned char>(b.text[0]);
+          if (line_hyphen && std::islower(next)) text.pop_back();  // a word broken at the cell's edge
+          else if (line_hyphen && (std::isupper(next) || std::isdigit(next))) {
+          }  // a compound broken there ("kg-" + "CO2-eq")
+          else if (!touching) text += ' ';
+        }
+        text += b.text;
+        prev = &b;
+      }
+    }
+    return text;
+  };
+  std::vector<std::vector<Cell>> cells;
+  std::vector<double> row_gap;  // space above each row
+  for (size_t idx = 0; idx < body.size(); ++idx) {
+    const size_t r = body[idx];
+    row_gap.push_back(idx == 0 ? 1e9 : rows[r].box.y0 - rows[body[idx - 1]].box.y1);
+    std::vector<Cell> row_cells;
+    std::vector<std::vector<size_t>> members;
+    double reach = -1e18;
+    for (size_t k : rows[r].boxes) {  // left to right
+      const auto& b = boxes[k];
+      if (b.text.empty()) continue;
+      const double em = std::max(4.0, b.type_size > 0 ? b.type_size : body_size);
+      if (members.empty() || b.box.x0 - reach > 0.8 * em) {
+        row_cells.push_back({b.box.x0, b.box.x1, {}});
+        members.push_back({});
+      }
+      members.back().push_back(k);
+      row_cells.back().x1 = std::max(row_cells.back().x1, b.box.x1);
+      reach = std::max(reach, b.box.x1);
+    }
+    for (size_t c = 0; c < row_cells.size(); ++c) row_cells[c].text = cell_text(members[c]);
+    cells.push_back(std::move(row_cells));
+  }
+  if (cells.size() < 2) return grid;
+  size_t most = 0;
+  for (const auto& row : cells) most = std::max(most, row.size());
+  if (most < 2) return grid;
+  // Column bands from the fullest rows.
+  std::vector<std::pair<double, double>> spans;
+  for (const auto& row : cells) {
+    if (row.size() * 10 < most * 6) continue;
+    for (const auto& c : row) spans.push_back({c.x0, c.x1});
+  }
+  std::sort(spans.begin(), spans.end());
+  std::vector<std::pair<double, double>> bands;
+  for (const auto& sp : spans) {
+    if (!bands.empty() && sp.first <= bands.back().second + 1.0) {
+      bands.back().second = std::max(bands.back().second, sp.second);
+    } else {
+      bands.push_back(sp);
+    }
+  }
+  // A band only one row reaches (a wide word space inside a cell) is part of
+  // a neighbour's column.
+  if (cells.size() >= 3) {
+    std::vector<size_t> support(bands.size(), 0);
+    for (const auto& row : cells) {
+      std::vector<bool> seen(bands.size(), false);
+      for (const auto& c : row) {
+        for (size_t i = 0; i < bands.size(); ++i) {
+          if (!seen[i] && std::min(c.x1, bands[i].second) - std::max(c.x0, bands[i].first) > 0) {
+            seen[i] = true;
+            ++support[i];
+          }
+        }
+      }
+    }
+    std::vector<std::pair<double, double>> kept;
+    for (size_t i = 0; i < bands.size(); ++i) {
+      if (support[i] >= 2 || kept.empty()) {
+        kept.push_back(bands[i]);
+      } else {
+        kept.back().second = std::max(kept.back().second, bands[i].second);
+      }
+    }
+    bands.swap(kept);
+  }
+  if (bands.size() < 2) return grid;
+  auto band_of = [&](const Cell& c) {
+    size_t best = 0;
+    double best_overlap = -1e18;
+    for (size_t i = 0; i < bands.size(); ++i) {
+      const double overlap = std::min(c.x1, bands[i].second) - std::max(c.x0, bands[i].first);
+      const double distance = overlap > 0 ? overlap : -std::min(std::abs(c.x0 - bands[i].second), std::abs(bands[i].first - c.x1));
+      if (distance > best_overlap) {
+        best_overlap = distance;
+        best = i;
+      }
+    }
+    return best;
+  };
+  const double table_x0 = bands.front().first, table_x1 = bands.back().second;
+  // Notes: from the first single-cell row reaching across most of the table
+  // after the body began, to the end.
+  size_t notes_from = cells.size();
+  for (size_t r = 1; r < cells.size(); ++r) {
+    if (cells[r].size() == 1 && cells[r][0].x1 - cells[r][0].x0 >= 0.6 * (table_x1 - table_x0) &&
+        split_words(cells[r][0].text).size() >= 5) {
+      notes_from = r;
+      break;
+    }
+  }
+  auto numeric = [](const std::string& t) {
+    size_t letters = 0, digits = 0;
+    for (unsigned char c : t) {
+      if (std::isalpha(c)) ++letters;
+      else if (std::isdigit(c)) ++digits;
+    }
+    return digits > letters;
+  };
+  if (std::getenv("AGENTPDF_DEBUG_TABLES")) {
+    for (size_t r = 0; r < cells.size(); ++r) {
+      std::fprintf(stderr, "TROW %zu:", r);
+      for (const auto& c : cells[r]) std::fprintf(stderr, " [%.0f-%.0f b%zu %s]", c.x0, c.x1, band_of(c), c.text.c_str());
+      std::fprintf(stderr, "\n");
+    }
+  }
+  // The table's usual spacing between rows: lines closer than that are one
+  // row's wrapped cells.
+  double usual_gap = 0;
+  {
+    std::vector<double> gaps;
+    for (size_t r = 1; r < row_gap.size(); ++r) {
+      if (row_gap[r] < 1e8) gaps.push_back(row_gap[r]);
+    }
+    if (!gaps.empty()) {
+      std::sort(gaps.begin(), gaps.end());
+      usual_gap = gaps[gaps.size() / 2];
+    }
+  }
+  std::string carried;  // a first cell's opening line, set alone above its row
+  for (size_t r = 0; r < notes_from; ++r) {
+    std::vector<std::string> out(bands.size());
+    for (const auto& c : cells[r]) {
+      auto& slot = out[band_of(c)];
+      if (!slot.empty()) slot += ' ';
+      slot += c.text;
+    }
+    if (!carried.empty()) {
+      out[0] = out[0].empty() ? carried : carried + ' ' + out[0];
+      carried.clear();
+    }
+    // A first cell wrapped onto two lines, its row on the second: the lone
+    // first line (within the first column) opens that cell.
+    const bool closer_below = r + 1 < row_gap.size() && row_gap[r + 1] < row_gap[r];
+    if (cells[r].size() == 1 && band_of(cells[r][0]) == 0 && cells[r][0].x1 <= bands[0].second + 2.0 &&
+        r + 1 < notes_from && cells[r + 1].size() >= 2 && band_of(cells[r + 1][0]) == 0 &&
+        !numeric(cells[r][0].text) && !std::islower(static_cast<unsigned char>(cells[r][0].text[0])) &&
+        (grid.rows.empty() || closer_below)) {
+      carried = out[0];
+      continue;
+    }
+    // A wrapped cell: text only under cells the row above fills with text,
+    // or a line whose every cell carries on a word or phrase (lowercase).
+    if (!grid.rows.empty()) {
+      auto& above = grid.rows.back();
+      size_t filled = 0;
+      bool fits = true, lower = true;
+      for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i].empty()) continue;
+        ++filled;
+        if (above[i].empty() || numeric(out[i]) || numeric(above[i])) fits = false;
+        if (above[i].empty() || !std::islower(static_cast<unsigned char>(out[i][0]))) lower = false;
+      }
+      // The header's own second line ("Dell Power" / "Edge R710"): words
+      // under the header's words, the first column left blank.
+      bool header_line = grid.rows.size() == 1 && out[0].empty() && filled > 0;
+      for (size_t i = 0; i < out.size() && header_line; ++i) {
+        const bool letters = std::any_of(out[i].begin(), out[i].end(), [](unsigned char c) { return std::isalpha(c); });
+        if (!out[i].empty() && (above[i].empty() || !letters)) header_line = false;
+      }
+      // Set closer than the rows are to one another: the row's own lines.
+      bool tight = usual_gap > 0 && r < row_gap.size() && row_gap[r] < usual_gap * 0.6 && out[0].empty() &&
+                   filled > 0;
+      for (size_t i = 0; i < out.size() && tight; ++i) {
+        if (!out[i].empty() && above[i].empty()) tight = false;
+      }
+      if ((fits && filled > 0 && filled * 2 <= out.size() && out[0].empty()) || tight || (lower && filled > 0) ||
+          header_line) {
+        for (size_t i = 0; i < out.size(); ++i) {
+          if (out[i].empty()) continue;
+          const bool hyphen = above[i].size() >= 2 && above[i].back() == '-' &&
+                              std::isalpha(static_cast<unsigned char>(above[i][above[i].size() - 2])) &&
+                              std::islower(static_cast<unsigned char>(out[i][0]));
+          if (hyphen) above[i].pop_back();
+          else above[i] += ' ';
+          above[i] += out[i];
+        }
+        continue;
+      }
+    }
+    grid.rows.push_back(std::move(out));
+  }
+  for (size_t r = notes_from; r < cells.size(); ++r) {
+    std::string text;
+    for (const auto& c : cells[r]) {
+      if (!text.empty()) text += ' ';
+      text += c.text;
+    }
+    if (!grid.notes.empty() && !text.empty() && std::islower(static_cast<unsigned char>(text[0]))) {
+      grid.notes.back() += ' ' + text;
+    } else if (!text.empty()) {
+      grid.notes.push_back(text);
+    }
+  }
+  if (grid.rows.size() < 2) grid.rows.clear();
+  return grid;
+}
+
 bool heading_like_row(const PageRow& row, double body, bool body_heavy) {
   if (row.words == 0 || row.words > 15 || row.letters < 4 || row.size <= 0) return false;
   return (row.heavy && !body_heavy && row.size >= body * 0.88) || row.size >= body * 1.08;
@@ -991,6 +1251,7 @@ double score_text_quality(const std::vector<NormalizedTextBox>& boxes) {
 }
 
 void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
+  page.tables.clear();
   if (page.wrapper_page) {
     for (auto& box : page.normalized_boxes) box.region = RegionKind::Wrapper;
     return;
@@ -1133,7 +1394,8 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       if (other.box.x1 <= label.box.x0 + 0.5 && (!columns.split || label.box.x0 - other.box.x1 < 1.0 * em))
         text_before = true;
       // "3", "3a.", "B.1", "A3:", "S2" (appendix and supplement numbering).
-      static const std::regex number_word(R"(^(?:[A-Z]\.?)?\d+(?:\.\d+)?[A-Za-z]?[\.:|]?$)");
+      // Roman numbers too ("TABLE II", IEEE).
+      static const std::regex number_word(R"(^(?:(?:[A-Z]\.?)?\d+(?:\.\d+)?[A-Za-z]?|[IVX]{1,6})[\.:|]?$)");
       if (!number && other.box.x0 >= label.box.x1 - 0.5 && other.box.x0 - label.box.x1 < 45 &&
           std::regex_match(other.text, number_word))
         number = &other;
@@ -1815,9 +2077,14 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         if (has_other_seed(row)) break;
         const double gap = row.box.y0 - rows[prev].box.y1;
         // In the caption's type, or its legend's (a size smaller), line to
-        // line: a raised symbol can lower a line's average a little.
+        // line: a raised symbol can lower a line's average a little; a title
+        // in small capitals has its initials in the caption's size.
+        const bool small_caps = std::abs(row.max_size - caption_size) <= caption_size * 0.08 &&
+                                row.letters >= 6 &&
+                                std::none_of(row.text.begin(), row.text.end(),
+                                             [](unsigned char c) { return std::islower(c); });
         if (row.size <= 0 || gap > caption_size * 0.8 || row.segments > 2 ||
-            (std::abs(row.size - caption_size) > caption_size * 0.08 &&
+            (!small_caps && std::abs(row.size - caption_size) > caption_size * 0.08 &&
              (prev == r0 || std::abs(row.size - rows[prev].size) > rows[prev].size * 0.05)))
           break;
         // A caption in the body type ends with its sentence; the text that
@@ -1845,6 +2112,29 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         take[i] = true;
         prev = i++;
       }
+      // A table whose caption stands under it: its rows above the caption,
+      // cells in rows (several runs, aligned with the row below, or mostly
+      // numbers), up to the text.
+      bool body_below = false;
+      for (size_t r = r0 + 1; r < rows.size(); ++r) body_below = body_below || (take[r] && !caption_row[r]);
+      auto claimed = [&](const PageRow& row) {
+        return std::any_of(row.boxes.begin(), row.boxes.end(),
+                           [&](size_t k) { return boxes[k].region == RegionKind::Float; });
+      };
+      if (table_seed && r0 > 0 && !body_below) {
+        size_t below = r0;
+        for (size_t j = r0; j-- > 0;) {
+          const auto& row = rows[j];
+          if (has_other_seed(row) || claimed(row) || running_text(row) ||
+              rows[below].box.y0 - row.box.y1 > body * 3)
+            break;
+          const bool cells = row.segments >= 2 || (below != r0 && aligned_rows(page, row, rows[below])) ||
+                             row.digits * 2 >= row.letters;
+          if (!cells) break;
+          take[j] = true;
+          below = j;
+        }
+      }
       if (to_lower(boxes[seed].text).rfind("fig", 0) == 0) {
         for (size_t j = r0; j-- > 0;) {
           const auto& row = rows[j];
@@ -1868,7 +2158,19 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         }
       }
       // The caption itself is kept (set between paragraphs); the rest of
-      // the island, the float's own material, is not.
+      // the island, the float's own material, is not. A table's rows are
+      // read into its grid, which its caption carries.
+      if (table_seed) {
+        std::vector<size_t> body_rows;
+        for (size_t r = 0; r < rows.size(); ++r) {
+          if (take[r] && !caption_row[r]) body_rows.push_back(r);
+        }
+        auto grid = table_grid(page, rows, body_rows, body);
+        if (!grid.rows.empty()) {
+          grid.label = boxes[seed].box;
+          page.tables.push_back(std::move(grid));
+        }
+      }
       for (size_t r = 0; r < rows.size(); ++r) {
         if (!take[r]) continue;
         for (size_t k : rows[r].boxes)
