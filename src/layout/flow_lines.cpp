@@ -1100,6 +1100,13 @@ void mark_paragraph_starts(std::vector<TextLine>& lines, const std::vector<doubl
       line.para_start = true;
       continue;
     }
+    // Ragged text: its lines fill most of the measure; one that ends a
+    // sentence well short of it ends a paragraph.
+    if (column && !cols.justified[pi] && cols.right[pi] - cols.left[pi] > 20.0 * em_of(prev) &&
+        prev.geom.x1 < cols.left[pi] + 0.7 * (cols.right[pi] - cols.left[pi])) {
+      line.para_start = true;
+      continue;
+    }
     if (column && line.block_start && line.geom.y0 - prev.geom.y1 > 0.9 * em_of(line)) {
       line.para_start = true;
       continue;
