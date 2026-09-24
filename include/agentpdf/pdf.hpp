@@ -56,6 +56,10 @@ Vocabulary build_vocabulary(const std::vector<PageDom>& pages);
 // compound (keep the hyphen) or one word broken by the typesetter?
 bool keep_line_end_hyphen(const std::string& first, const std::string& second,
                           const Vocabulary& vocab);
+
+// A word broken across a page turn (lines rebuilt from their words): joined
+// as the document's own usage says.
+void join_page_turn_hyphens(std::vector<PageDom>& pages, const Vocabulary& vocab);
 // Poppler's reading-order text rebuilt from the page's own text-layer
 // words: each word keeps the region its box was classified into, so
 // non-body text leaves the stream word by word, and every line carries its

@@ -22,7 +22,8 @@ void rejoin_hyphenated_lines(std::vector<TextLine>& lines) {
     if (!out.empty()) {
       auto& prev = out.back();
       auto& cur = lines[i];
-      if (!prev.text.empty() && prev.text.back() == '-' && !cur.text.empty() &&
+      // Lines rebuilt from their words were joined with the vocabulary.
+      if (!prev.has_geom && !cur.has_geom && !prev.text.empty() && prev.text.back() == '-' && !cur.text.empty() &&
           std::islower(static_cast<unsigned char>(cur.text.front()))) {
         prev.text.pop_back();
         prev.text += cur.text;
@@ -735,6 +736,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
   }
   const BodyAnchor anchor = find_body_anchor(dom);
   const auto style_levels = heading_style_levels(dom, heuristics, anchor.page, anchor.line);
+  std::vector<Block> pending_captions;
   bool body_started = false;
   bool frontiers_wait_for_intro = false;
   bool references_seen = false;
@@ -756,9 +758,20 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       cur = Block{};
       cur.page = page.index;
     };
+    // Captions wait for the paragraph they interrupt to end: they go in at
+    // the next paragraph boundary, never inside running text.
+    auto release_captions = [&] {
+      for (auto& c : pending_captions) {
+        c.page = page.index;
+        page.blocks.push_back(std::move(c));
+        ++dom.figure_count;
+      }
+      pending_captions.clear();
+    };
 
     bool first_line_of_page = true;
     bool after_equation = false;
+    const TextLine* last_caption_line = nullptr;
     for (size_t i = 0; i < page.lines.size(); ++i) {
       const auto& line = page.lines[i];
       auto text = collapse_ws(normalize_typography(line.text));
@@ -875,6 +888,63 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           text = rest;
           low = to_lower(text);
         }
+      }
+
+      // A caption line: gathered into its caption, which waits for the end
+      // of the paragraph around it.
+      if (line.caption) {
+        // The caption's next line: joins it, whether it is still waiting or
+        // already placed.
+        // A line of the column beside a caption can come between two of its
+        // lines; the caption's own next line is set close under the last.
+        // A caption set directly under another opens with its own label.
+        Block* open = nullptr;
+        bool continues = false;
+        if (line.has_geom) {
+          static const std::regex label(R"(^(fig(ure)?s?\.?|tab(le)?\.?|scheme|chart|plate)\s*[A-Z]?\d)",
+                                        std::regex::icase);
+          if (last_caption_line && last_caption_line->has_geom && !std::regex_search(text, label)) {
+            const auto& a = last_caption_line->geom;
+            const auto& b = line.geom;
+            const double em = std::max(4.0, line.font_size > 0 ? line.font_size : b.height());
+            const double gap = b.y0 - a.y1;
+            continues = gap > -0.5 * em && gap < 0.9 * em && std::min(a.x1, b.x1) - std::max(a.x0, b.x0) > 0;
+          }
+        } else {
+          continues = i > 0 && page.lines[i - 1].caption;
+        }
+        if (continues) {
+          if (!pending_captions.empty()) {
+            open = &pending_captions.back();
+          } else {
+            for (auto it = page.blocks.rbegin(); it != page.blocks.rend(); ++it) {
+              if (it->kind == BlockKind::Caption) {
+                open = &*it;
+                break;
+              }
+            }
+          }
+        }
+        last_caption_line = &line;
+        if (open) {
+          auto& c = open->text;
+          if (c.size() >= 2 && c.back() == '-' && std::isalpha(static_cast<unsigned char>(c[c.size() - 2])) &&
+              std::islower(static_cast<unsigned char>(text.front()))) {
+            c.pop_back();
+            c += text;
+          } else {
+            c += " " + text;
+          }
+        } else {
+          Block caption;
+          caption.kind = BlockKind::Caption;
+          caption.text = text;
+          caption.box = line.box;
+          caption.page = page.index;
+          pending_captions.push_back(std::move(caption));
+        }
+        if (cur.text.empty()) release_captions();
+        continue;
       }
 
       // Abstract / Keywords labels, including letter-spaced, glued
@@ -1087,6 +1157,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
                              cur.text.back() == ':' || line.para_start || line.block_start;
         if (!numbered && between) {
           flush();
+          release_captions();
           Block hb;
           hb.kind = BlockKind::Heading;
           const auto style = style_of(line, text);
@@ -1128,6 +1199,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         if (std::regex_search(text, numbered) || pure || low == "abstract" || low == "references" ||
             low == "keywords" || low == "conclusion") {
           flush();
+          release_captions();
           Block hb;
           hb.kind = BlockKind::Heading;
           hb.heading_level = hl;
@@ -1206,6 +1278,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           (references_seen && std::regex_search(text, biography)) ||
           is_list_item_start(text, cur.text)) {
         flush();
+        release_captions();
         cur.kind = BlockKind::Paragraph;
         cur.text = text;
         cur.box = line.box;
@@ -1217,6 +1290,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       // A display equation stands between paragraphs, as it is set.
       if (line.equation) {
         flush();
+        release_captions();
         Block eq;
         eq.kind = BlockKind::Paragraph;
         eq.text = text;
@@ -1228,7 +1302,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         continue;
       }
       // Page geometry marks where paragraphs begin (flow_box_lines).
-      if ((line.para_start || after_equation) && !cur.text.empty()) flush();
+      if ((line.para_start || after_equation) && !cur.text.empty()) {
+        flush();
+        release_captions();
+      }
       if (after_equation && cur.text.empty()) {
         // The text resumes under the equation as a paragraph of its own.
         after_equation = false;
@@ -1274,6 +1351,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         // wraps, not semantic paragraph boundaries. Only flush when the
         // accumulated text already looks like a finished sentence.
         flush();
+        release_captions();
         cur.kind = BlockKind::Paragraph;
         cur.text = text;
         cur.box = line.box;
@@ -1305,6 +1383,19 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       }
     }
     flush();
+  }
+  // Captions still waiting at the end follow the last text.
+  if (!pending_captions.empty()) {
+    for (auto page = dom.pages.rbegin(); page != dom.pages.rend(); ++page) {
+      if (page->wrapper_page) continue;
+      for (auto& c : pending_captions) {
+        c.page = page->index;
+        page->blocks.push_back(std::move(c));
+        ++dom.figure_count;
+      }
+      pending_captions.clear();
+      break;
+    }
   }
   // Furniture labels whose content was dropped (a masthead line, an
   // aggregator section label) would otherwise end the note.

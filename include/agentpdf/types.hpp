@@ -18,7 +18,8 @@ enum class RegionKind {
   Footnote,
   AuthorNote,
   Wrapper,
-  Metadata
+  Metadata,
+  Caption  // a float's caption: kept, set between paragraphs
 };
 
 enum class LayoutFamily {
@@ -211,6 +212,7 @@ struct TextLine {
   size_t runin_len = 0;
   bool gapped = false;  // words set apart by gaps wider than two ems (table cells)
   bool equation = false;  // a display equation, set apart from the text
+  bool caption = false;   // a figure's or table's caption
 };
 
 struct Block {

@@ -3,6 +3,8 @@
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <cmath>
 #include <map>
@@ -569,9 +571,15 @@ PageColumns detect_page_columns(const PageDom& page, double top, double bottom) 
 // Running text: body type across the column's measure in one run of words
 // (two runs where a full-width element sits over two columns); a table's
 // rows break into cells.
-bool body_like_row(const PageRow& row, double body, const PageColumns& columns, int side) {
+// `page_body`: the size most of this page's running text is set in, which
+// can differ from the document's (ACS sets its methods section and
+// references a point smaller).
+bool body_like_row(const PageRow& row, double body, double page_body, const PageColumns& columns,
+                   int side) {
   if (row.words < 4 || row.size <= 0) return false;
-  if (std::abs(row.size - body) > body * 0.07) return false;
+  if (std::abs(row.size - body) > body * 0.07 &&
+      (page_body <= 0 || std::abs(row.size - page_body) > page_body * 0.07))
+    return false;
   if (row.digits * 2 > row.letters) return false;
   // Two runs are two columns of prose side by side (under a full-width
   // figure, where too few rows remain for the gutter to be measured).
@@ -593,6 +601,11 @@ bool aligned_rows(const PageDom& page, const PageRow& upper, const PageRow& lowe
     const auto& before = page.normalized_boxes[lower.boxes[i - 1]];
     const double em = std::max(4.0, word.type_size > 0 ? word.type_size : word.box.height());
     if (word.box.x0 - before.box.x1 < 0.8 * em) continue;
+    // A text column's own left edge lines up in every row: not a cell.
+    const bool column_start = std::any_of(page.gutters.begin(), page.gutters.end(), [&](double g) {
+      return before.box.x1 <= g + 1.0 && word.box.x0 >= g - 1.0;
+    });
+    if (column_start) continue;
     for (size_t j = 1; j < upper.boxes.size(); ++j) {
       if (std::abs(page.normalized_boxes[upper.boxes[j]].box.x0 - word.box.x0) <= 2.0) {
         ++aligned;
@@ -822,6 +835,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
                                                   : footnote_start_right;
     start = std::min(start, box.box.y0);
   }
+  double page_body = 0;  // typed pages: the size of this page's running text
   // Typed pages of unknown templates: columns from the page geometry,
   // footnote keys that start a line of smaller type at their column's left
   // edge. The named families keep their own tuned rules (and overrides).
@@ -839,6 +853,26 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       columns.split = !columns.gutters.empty();
     } else {
       page.gutters = columns.split ? columns.gutters : std::vector<double>{};
+    }
+    {
+      // Prose rows (many words, mostly lowercase-initial, one or two runs),
+      // weighted by their letters: the page's own body size.
+      std::vector<size_t> all;
+      for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
+        const auto& b = page.normalized_boxes[k];
+        if (b.rotation == 0 && b.box.y0 >= top && b.box.y1 <= bottom) all.push_back(k);
+      }
+      std::map<long, size_t> letters_by_size;
+      for (const auto& row : page_rows(page, all)) {
+        if (row.words < 8 || row.size <= 0 || row.segments > 2) continue;
+        if (row.lower_words * 10 < row.words * 6) continue;
+        letters_by_size[std::lround(row.size * 10.0)] += row.letters;
+      }
+      if (!letters_by_size.empty()) {
+        const auto mode = std::max_element(letters_by_size.begin(), letters_by_size.end(),
+                                           [](const auto& a, const auto& b) { return a.second < b.second; });
+        page_body = static_cast<double>(mode->first) / 10.0;
+      }
     }
     const int n_columns = column_count(columns);
     typed_footnote_start.assign(static_cast<size_t>(n_columns), page.height + 1);
@@ -904,7 +938,8 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       }
     }
     const bool capitals = letters >= 3 && uppers == letters;
-    const bool typographic = (label.type_size > 0 && label.type_size < body * 0.95) ||
+    const bool typographic = (label.type_size > 0 && label.type_size < body * 0.95 &&
+                              (page_body <= 0 || label.type_size < page_body * 0.95)) ||
                              (label.type_heavy && !page.body_font_heavy) || capitals ||
                              label.type_italic;
     if (typographic) return true;
@@ -1166,14 +1201,255 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       return std::find(typed_seeds.begin(), typed_seeds.end(), k) != typed_seeds.end();
     };
     for (size_t seed : typed_seeds) {
-      const int side = side_of(columns, boxes[seed].box);
+      // The caption's column: that of its first line, which runs on from the
+      // label across the gutter when the caption spans the page.
+      int side = side_of(columns, boxes[seed].box);
+      double seed_reach = boxes[seed].box.x1;
+      // A column of text can run on beside a figure that spans the gutter
+      // (its lines start at one x, right of the caption): the island ends
+      // short of it.
+      double bound_x1 = 1e18;
+      // The reach of a line from its first word, by word spacing only: a
+      // gutter is narrow (an em or two), so the next column's text on the
+      // same row must not count.
+      auto reach_from = [&](size_t start, double& beside) {
+        std::vector<size_t> row;
+        for (size_t k = 0; k < boxes.size(); ++k) {
+          if (boxes[k].rotation == 0 && rows_overlap(boxes[start].box, boxes[k].box) &&
+              boxes[k].box.x0 >= boxes[start].box.x0 - 0.5)
+            row.push_back(k);
+        }
+        std::sort(row.begin(), row.end(),
+                  [&](size_t a, size_t b) { return boxes[a].box.x0 < boxes[b].box.x0; });
+        double reach = boxes[start].box.x1;
+        beside = 1e18;
+        for (size_t k : row) {
+          const double em = std::max(4.0, boxes[k].type_size > 0 ? boxes[k].type_size : body);
+          if (boxes[k].box.x0 - reach > 0.6 * em) {
+            beside = boxes[k].box.x0;
+            break;
+          }
+          reach = std::max(reach, boxes[k].box.x1);
+        }
+        return reach;
+      };
+      // The next line of a caption: its first word under the caption's
+      // first, set close below in the caption's type.
+      auto next_caption_line = [&](size_t line_start) {
+        const auto& first = boxes[line_start].box;
+        const double size = boxes[line_start].type_size > 0 ? boxes[line_start].type_size : body;
+        size_t next = boxes.size();
+        for (size_t k = 0; k < boxes.size(); ++k) {
+          const auto& b = boxes[k];
+          if (b.rotation != 0 || std::abs(b.box.x0 - boxes[seed].box.x0) > 2.0) continue;
+          if (b.box.y0 <= first.y0 + first.height() * 0.5 || b.box.y0 - first.y1 > size * 0.9) continue;
+          if (b.type_size > 0 && std::abs(b.type_size - size) > size * 0.12) continue;
+          if (next == boxes.size() || b.box.y0 < boxes[next].box.y0) next = k;
+        }
+        return next;
+      };
+      if (columns.split && side >= 0) {
+        // The caption spans the gutter when its first line does, or a line
+        // of its paragraph under it (a short title over a full-width legend).
+        size_t line_start = seed;
+        for (int line = 0; line < 4 && side >= 0; ++line) {
+          double beside = 1e18;
+          const double reach = reach_from(line_start, beside);
+          if (line == 0) seed_reach = reach;
+          const auto& first = boxes[line_start].box;
+          if (side_of(columns, BBox{first.x0, first.y0, reach, first.y1}) < 0) {
+            side = -1;
+            seed_reach = std::max(seed_reach, reach);
+            if (beside < 1e17) {
+              int starts = 0;
+              for (const auto& b : boxes) {
+                if (b.rotation == 0 && std::abs(b.box.x0 - beside) <= 2.0 &&
+                    std::abs(b.box.cy() - first.cy()) <= body * 8)
+                  ++starts;
+              }
+              if (starts >= 3) bound_x1 = (reach + beside) / 2;
+            }
+            break;
+          }
+          const size_t next = next_caption_line(line_start);
+          if (next == boxes.size()) break;
+          line_start = next;
+        }
+      }
+      const auto seed_low = fold_lower_utf8(boxes[seed].text);
+      const bool table_seed = seed_low.rfind("tab", 0) == 0 || seed_low.rfind("cuadro", 0) == 0 ||
+                              seed_low.rfind("quadro", 0) == 0;
+      // Running text ends the island. Across the gutter, a line of it in
+      // either column does (beside a short line in the other, or beside the
+      // figure's own labels). A table spanning the page ends where the page
+      // returns to columns of prose side by side (a table's cells are
+      // narrower, or cross the gutter).
+      auto running_text = [&](const PageRow& row) {
+        if (body_like_row(row, body, page_body, columns, side)) return true;
+        if (!columns.split || side >= 0) return false;
+        std::map<int, std::vector<size_t>> by_column;
+        bool crosses = false;
+        for (size_t k : row.boxes) {
+          const int column = side_of(columns, boxes[k].box);
+          if (column >= 0) by_column[column].push_back(k);
+          else crosses = true;
+        }
+        int prose_columns = 0;
+        for (const auto& [column, part] : by_column) {
+          for (const auto& sub : page_rows(page, part)) {
+            if (!table_seed && body_like_row(sub, body, page_body, columns, column)) return true;
+            if (sub.words >= 4 && sub.segments <= 1 && sub.letters > 2 * sub.digits &&
+                sub.box.width() >= 0.6 * column_width(columns, column)) {
+              ++prose_columns;
+              break;
+            }
+          }
+        }
+        return table_seed && !crosses && prose_columns >= 2;
+      };
+      // Another float's caption (or one already placed) ends this island.
+      auto has_other_seed = [&](const PageRow& row) {
+        return std::any_of(row.boxes.begin(), row.boxes.end(), [&](size_t k) {
+          return k != seed && (is_seed(k) || boxes[k].region == RegionKind::Caption);
+        });
+      };
+      auto candidate = [&](size_t k) {
+        const auto& b = boxes[k];
+        return (b.region == RegionKind::Body || b.region == RegionKind::Float || b.region == RegionKind::Caption) &&
+               b.rotation == 0 && b.box.y0 >= top && b.box.y1 <= bottom;
+      };
+
+      // A caption set in a narrow block beside its figure (a side caption):
+      // its lines are the block's own, and the figure is what stands beside
+      // and around it, across the gutter when it reaches the other column.
+      if (side >= 0 && !table_seed) {
+        std::vector<size_t> chain;
+        double strip_x1 = boxes[seed].box.x1;
+        for (size_t line_start = seed; line_start < boxes.size() && chain.size() < 40;
+             line_start = next_caption_line(line_start)) {
+          chain.push_back(line_start);
+          double beside = 1e18;
+          strip_x1 = std::max(strip_x1, reach_from(line_start, beside));
+        }
+        const double strip_x0 = boxes[seed].box.x0;
+        const double cap_y0 = boxes[chain.front()].box.y0 - 1.0;
+        const double cap_y1 = boxes[chain.back()].box.y1 + 1.0;
+        std::vector<size_t> caption_boxes, others, beside, beside_other;
+        if (chain.size() >= 3 && strip_x1 - strip_x0 <= 0.5 * column_width(columns, side)) {
+          for (size_t k = 0; k < boxes.size(); ++k) {
+            if (!candidate(k)) continue;
+            const auto& b = boxes[k].box;
+            if (b.x0 >= strip_x0 - 1.0 && b.x1 <= strip_x1 + 1.0 && b.y0 >= cap_y0 && b.y1 <= cap_y1) {
+              caption_boxes.push_back(k);
+              continue;
+            }
+            others.push_back(k);
+            if (b.cy() < cap_y0 || b.cy() > cap_y1 || b.x0 <= strip_x1) continue;
+            const int column = side_of(columns, b);
+            (column == side || column < 0 ? beside : beside_other).push_back(k);
+          }
+        }
+        // The figure's material stands beside the caption in its column; text
+        // wrapping round a narrow caption would be running text.
+        bool side_caption = beside.size() >= 2;
+        for (const auto& row : page_rows(page, beside)) {
+          if (body_like_row(row, body, page_body, columns, side)) side_caption = false;
+        }
+        if (side_caption) {
+          // The figure reaches into the next column when all it holds beside
+          // the caption is figure material.
+          bool text_beside = false;
+          for (const auto& row : page_rows(page, beside_other)) {
+            if (body_like_row(row, body, page_body, columns, side_of(columns, row.box))) text_beside = true;
+          }
+          if (columns.split && !beside_other.empty() && !text_beside) {
+            side = -1;
+          } else if (columns.split) {
+            others.erase(std::remove_if(others.begin(), others.end(),
+                                        [&](size_t k) {
+                                          const int column = side_of(columns, boxes[k].box);
+                                          return column >= 0 && column != side;
+                                        }),
+                         others.end());
+          }
+          auto rows = page_rows(page, others);
+          std::vector<bool> take(rows.size(), false);
+          size_t first_beside = rows.size(), last_beside = rows.size();
+          for (size_t r = 0; r < rows.size(); ++r) {
+            if (rows[r].box.y1 < cap_y0 || rows[r].box.y0 > cap_y1) continue;
+            if (has_other_seed(rows[r]) || running_text(rows[r])) continue;
+            take[r] = true;
+            if (first_beside == rows.size()) first_beside = r;
+            last_beside = r;
+          }
+          if (first_beside < rows.size()) {
+            for (size_t j = first_beside; j-- > 0;) {
+              if (rows[j].box.y1 >= cap_y0) continue;
+              if (has_other_seed(rows[j]) || running_text(rows[j]) ||
+                  heading_like_row(rows[j], body, page.body_font_heavy))
+                break;
+              take[j] = true;
+            }
+            size_t prev = last_beside;
+            for (size_t j = last_beside + 1; j < rows.size(); ++j) {
+              if (rows[j].box.y0 <= cap_y1) continue;
+              if (has_other_seed(rows[j]) || running_text(rows[j]) ||
+                  heading_like_row(rows[j], body, page.body_font_heavy) ||
+                  rows[j].box.y0 - rows[prev].box.y1 > body * 6)
+                break;
+              take[j] = true;
+              prev = j;
+            }
+          }
+          if (std::getenv("AGENTPDF_DEBUG_ISLANDS")) {
+            std::fprintf(stderr, "ISLAND p%d side caption '%s' strip %.0f-%.0f lines %zu figure side %d\n",
+                         page.index, boxes[seed].text.c_str(), strip_x0, strip_x1, chain.size(), side);
+            for (size_t r = 0; r < rows.size(); ++r) {
+              if (take[r]) std::fprintf(stderr, "   flt y=%.1f |%.90s|\n", rows[r].box.y0, rows[r].text.c_str());
+            }
+          }
+          for (size_t k : caption_boxes) boxes[k].region = RegionKind::Caption;
+          for (size_t r = 0; r < rows.size(); ++r) {
+            if (!take[r]) continue;
+            for (size_t k : rows[r].boxes) boxes[k].region = RegionKind::Float;
+          }
+          continue;
+        }
+      }
+      // Members: boxes of the caption's column, or of the columns its first
+      // line crosses (a figure can fill two columns of three, with text
+      // running on in the third beside it).
+      int first_column = side, last_column = side;
+      if (side < 0 && columns.split) {
+        first_column = 0;
+        last_column = column_count(columns) - 1;
+        for (size_t g = 0; g < columns.gutters.size(); ++g) {
+          if (boxes[seed].box.x0 >= columns.gutters[g] - 1.0) first_column = static_cast<int>(g) + 1;
+        }
+        for (size_t g = columns.gutters.size(); g-- > 0;) {
+          if (seed_reach <= columns.gutters[g] + 1.0) last_column = static_cast<int>(g);
+        }
+      }
+      auto column_of = [&](double x) {
+        int column = 0;
+        for (double g : columns.gutters) {
+          if (x > g) ++column;
+        }
+        return column;
+      };
       std::vector<size_t> members;
       for (size_t k = 0; k < boxes.size(); ++k) {
         const auto& b = boxes[k];
-        if (b.region != RegionKind::Body && b.region != RegionKind::Float) continue;
+        if (b.region != RegionKind::Body && b.region != RegionKind::Float &&
+            b.region != RegionKind::Caption)
+          continue;
         if (b.rotation != 0 || b.box.y0 < top || b.box.y1 > bottom) continue;
         const int other = side_of(columns, b.box);
         if (columns.split && side >= 0 && other >= 0 && other != side) continue;
+        if (columns.split && side < 0 &&
+            (column_of(b.box.x1 - 1.0) < first_column || column_of(b.box.x0 + 1.0) > last_column ||
+             b.box.cx() > bound_x1))
+          continue;
         members.push_back(k);
       }
       auto rows = page_rows(page, members);
@@ -1182,12 +1458,9 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         if (std::find(rows[r].boxes.begin(), rows[r].boxes.end(), seed) != rows[r].boxes.end()) r0 = r;
       }
       if (r0 == rows.size()) continue;
-      auto has_other_seed = [&](const PageRow& row) {
-        return std::any_of(row.boxes.begin(), row.boxes.end(),
-                           [&](size_t k) { return k != seed && is_seed(k); });
-      };
       std::vector<bool> take(rows.size(), false);
-      take[r0] = true;
+      std::vector<bool> caption_row(rows.size(), false);
+      take[r0] = caption_row[r0] = true;
       const double caption_size = rows[r0].size > 0 ? rows[r0].size : body;
       const bool body_size_caption = std::abs(caption_size - body) <= body * 0.05;
       size_t i = r0 + 1, prev = r0;
@@ -1195,23 +1468,21 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         const auto& row = rows[i];
         if (has_other_seed(row)) break;
         const double gap = row.box.y0 - rows[prev].box.y1;
-        if (row.size <= 0 || std::abs(row.size - caption_size) > caption_size * 0.08 ||
-            gap > caption_size * 0.8)
+        // In the caption's type, or its legend's (a size smaller), line to
+        // line: a raised symbol can lower a line's average a little.
+        if (row.size <= 0 || gap > caption_size * 0.8 || row.segments > 2 ||
+            (std::abs(row.size - caption_size) > caption_size * 0.08 &&
+             (prev == r0 || std::abs(row.size - rows[prev].size) > rows[prev].size * 0.05)))
           break;
         // A caption in the body type ends with its sentence; the text that
         // follows it closely is the body again.
         const auto last = trim(rows[prev].text);
-        if (body_size_caption && !last.empty() && last.back() == '.' &&
-            body_like_row(row, body, columns, side))
-          break;
-        take[i] = true;
+        if (body_size_caption && !last.empty() && last.back() == '.' && running_text(row)) break;
+        take[i] = caption_row[i] = true;
         prev = i++;
       }
       // A table's body follows its caption; its bold header row is not a
       // section heading unless running text follows it directly.
-      const auto seed_low = fold_lower_utf8(boxes[seed].text);
-      const bool table_seed = seed_low.rfind("tab", 0) == 0 || seed_low.rfind("cuadro", 0) == 0 ||
-                              seed_low.rfind("quadro", 0) == 0;
       while (i < rows.size()) {
         const auto& row = rows[i];
         if (has_other_seed(row)) break;
@@ -1219,10 +1490,9 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         // the body type across the measure.
         const bool table_row = table_seed && take[prev] && prev != r0 &&
                                aligned_rows(page, rows[prev], row);
-        if (!table_row && body_like_row(row, body, columns, side)) break;
+        if (!table_row && running_text(row)) break;
         if (!table_row && heading_like_row(row, body, page.body_font_heavy)) {
-          const bool introduces_text =
-              row.segments <= 1 && i + 1 < rows.size() && body_like_row(rows[i + 1], body, columns, side);
+          const bool introduces_text = row.segments <= 1 && i + 1 < rows.size() && running_text(rows[i + 1]);
           if (!table_seed || introduces_text) break;
         }
         if (row.box.y0 - rows[prev].box.y1 > body * 6) break;
@@ -1232,25 +1502,36 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       if (to_lower(boxes[seed].text).rfind("fig", 0) == 0) {
         for (size_t j = r0; j-- > 0;) {
           const auto& row = rows[j];
-          if (has_other_seed(row) || body_like_row(row, body, columns, side) ||
-              heading_like_row(row, body, page.body_font_heavy))
+          if (has_other_seed(row) || running_text(row) || heading_like_row(row, body, page.body_font_heavy))
             break;
           // The short last line of a paragraph, set close under its text.
-          if (j > 0 && row.size > 0 && std::abs(row.size - body) <= body * 0.07 &&
-              body_like_row(rows[j - 1], body, columns, side) &&
+          if (j > 0 && row.size > 0 && std::abs(row.size - body) <= body * 0.07 && running_text(rows[j - 1]) &&
               row.box.y0 - rows[j - 1].box.y1 <= body * 0.6)
             break;
           take[j] = true;
         }
       }
+      if (std::getenv("AGENTPDF_DEBUG_ISLANDS")) {
+        std::fprintf(stderr, "ISLAND p%d seed '%s' side %d gutters", page.index, boxes[seed].text.c_str(), side);
+        for (double g : columns.gutters) std::fprintf(stderr, " %.0f", g);
+        std::fprintf(stderr, "\n");
+        for (size_t r = 0; r < rows.size(); ++r) {
+          if (!take[r]) continue;
+          std::fprintf(stderr, "   %s y=%.1f size=%.2f seg=%d w=%.0f |%.90s|\n", caption_row[r] ? "CAP" : "flt",
+                       rows[r].box.y0, rows[r].size, rows[r].segments, rows[r].box.width(), rows[r].text.c_str());
+        }
+      }
+      // The caption itself is kept (set between paragraphs); the rest of
+      // the island, the float's own material, is not.
       for (size_t r = 0; r < rows.size(); ++r) {
         if (!take[r]) continue;
-        for (size_t k : rows[r].boxes) boxes[k].region = RegionKind::Float;
+        for (size_t k : rows[r].boxes)
+          boxes[k].region = caption_row[r] ? RegionKind::Caption : RegionKind::Float;
       }
     }
     // A table the previous page left open at its foot continues at the top
     // of this page's column: aligned rows until running text.
-    if (page.table_continues) {
+    if (page.table_continues && page.gutters.empty()) {
       std::vector<size_t> members;
       for (size_t k = 0; k < boxes.size(); ++k) {
         const auto& b = boxes[k];
@@ -1273,7 +1554,8 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       double lowest = 0, lowest_body = 0;
       for (const auto& b : boxes) {
         if (b.box.y1 > bottom) continue;
-        if (b.region == RegionKind::Float) lowest = std::max(lowest, b.box.y1);
+        if (b.region == RegionKind::Float || b.region == RegionKind::Caption)
+          lowest = std::max(lowest, b.box.y1);
         if (b.region == RegionKind::Body) lowest_body = std::max(lowest_body, b.box.y1);
       }
       page.table_open_at_foot = lowest > lowest_body && lowest > page.height * 0.8;
@@ -1708,6 +1990,8 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
     for (size_t i = 1; i < page.lines.size(); ++i) {
       auto& previous = page.lines[i - 1];
       auto& current = page.lines[i];
+      // Lines rebuilt from their words were joined with the vocabulary.
+      if (previous.has_geom || current.has_geom) continue;
       if (!previous.text.empty() && previous.text.back() == '-' &&
           !current.text.empty() &&
           std::islower(static_cast<unsigned char>(current.text.front()))) {
@@ -1730,6 +2014,7 @@ void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics) {
     if (previous_page.lines.empty() || current_page.lines.empty()) continue;
     auto& previous_line = previous_page.lines.back();
     auto& previous = previous_line.text;
+    if (previous_line.has_geom || current_page.lines.front().has_geom) continue;
     size_t current_index = 0;
     if (previous.ends_with(" tem")) {
       for (size_t i = 0; i < current_page.lines.size(); ++i) {

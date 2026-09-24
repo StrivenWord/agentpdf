@@ -87,6 +87,7 @@ std::string normalize_typography(const std::string& s) {
       unsigned cp = ((c & 0x0F) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6) |
                     (static_cast<unsigned char>(s[i + 2]) & 0x3F);
       if (cp == 0x2018 || cp == 0x2019 || cp == 0x2032) out.push_back('\'');
+      else if (cp == 0x2010 || cp == 0x2011) out.push_back('-');  // hyphen, non-breaking hyphen
       else if (cp == 0x201C || cp == 0x201D) out.push_back('"');
       else if (cp == 0x2013 || cp == 0x2014) {
         out += " - ";  // en/em dash as spaced hyphen so words stay separate

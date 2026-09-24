@@ -57,6 +57,7 @@ RegionKind region_kind_from_name(const std::string& name) {
   if (low == "metadata") return RegionKind::Metadata;
   if (low == "wrapper") return RegionKind::Wrapper;
   if (low == "authornote" || low == "author_note") return RegionKind::AuthorNote;
+  if (low == "caption") return RegionKind::Caption;
   return RegionKind::Float;
 }
 

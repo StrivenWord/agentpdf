@@ -804,6 +804,7 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
 
   if (heuristics.footnotes_to_endnotes) link_note_markers(result.dom);
   stitch_document_lines(result.dom, heuristics);
+  if (heuristics.rejoin_hyphenation) join_page_turn_hyphens(pages, vocab);
   mark_page_turn_paragraphs(pages);
 
   // Typographic evidence for heading detection (lines rebuilt from their own

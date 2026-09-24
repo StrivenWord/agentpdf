@@ -227,9 +227,16 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     bool leading_heavy = true;  // still inside a bold opening phrase
     size_t heavy_end = 0;       // text length at its end
     std::vector<size_t> kept;
+    // Running text carries the captions too, marked as such.
+    size_t caption_boxes = 0;
     for (size_t k : vl.boxes) {
-      if ((any_region || boxes[k].region == region) && !boxes[k].text.empty()) kept.push_back(k);
+      const bool wanted = any_region || boxes[k].region == region ||
+                          (region == RegionKind::Body && boxes[k].region == RegionKind::Caption);
+      if (!wanted || boxes[k].text.empty()) continue;
+      kept.push_back(k);
+      if (boxes[k].region == RegionKind::Caption) ++caption_boxes;
     }
+    line.caption = !any_region && !kept.empty() && caption_boxes * 2 > kept.size();
     // A footnote's printed key opens its first line: a number or symbol set
     // smaller or higher than the note's text.
     size_t begin = 0;
@@ -374,9 +381,14 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
   // first line never continues the previous note.
   for (size_t i = 0; i + 1 < out.size(); ++i) {
     auto& a = out[i];
-    auto& b = out[i + 1];
-    if (!b.note_key.empty()) continue;
-    if (!ends_with_line_hyphen(a.text) || b.text.empty()) continue;
+    if (!ends_with_line_hyphen(a.text)) continue;
+    // The next line of its own kind: a caption's lines and the text's
+    // alternate where a caption shares its rows with a column beside it.
+    size_t j = i + 1;
+    while (j < out.size() && out[j].caption != a.caption) ++j;
+    if (j == out.size()) continue;
+    auto& b = out[j];
+    if (!b.note_key.empty() || b.text.empty()) continue;
     const auto space = b.text.find(' ');
     const std::string word = b.text.substr(0, space);
     const auto last_space = a.text.rfind(' ');
@@ -504,8 +516,13 @@ std::vector<VisualLine> merge_row_fragments(std::vector<VisualLine> visual,
   std::vector<VisualLine> out;
   out.reserve(visual.size());
   for (auto& line : visual) {
+    auto captioned = [&](const VisualLine& l) {
+      size_t n = 0;
+      for (size_t k : l.boxes) n += boxes[k].region == RegionKind::Caption ? 1 : 0;
+      return n * 2 > l.boxes.size();
+    };
     if (!out.empty() && boxes[line.boxes.front()].rotation == 0 &&
-        boxes[out.back().boxes.front()].rotation == 0) {
+        boxes[out.back().boxes.front()].rotation == 0 && captioned(out.back()) == captioned(line)) {
       const BBox a = extent(out.back());
       const BBox b = extent(line);
       const double overlap = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
@@ -541,7 +558,7 @@ LineColumns measure_line_columns(const std::vector<TextLine>& lines) {
   for (size_t i = 0; i < n; ++i) {
     std::vector<double> left, right;
     for (size_t j = 0; j < n; ++j) {
-      if (!lines[j].has_geom || !same_column(lines[i].geom, lines[j].geom)) continue;
+      if (!lines[j].has_geom || lines[j].caption || !same_column(lines[i].geom, lines[j].geom)) continue;
       left.push_back(lines[j].geom.x0);
       right.push_back(lines[j].geom.x1);
     }
@@ -587,7 +604,7 @@ void group_display_equations(std::vector<TextLine>& lines) {
   std::vector<bool> display(lines.size(), false);
   for (size_t i = 0; i < lines.size(); ++i) {
     const auto& l = lines[i];
-    if (!l.has_geom) continue;
+    if (!l.has_geom || l.caption) continue;
     const auto t = trim(l.text);
     const double em = em_of(l);
     const bool number = std::regex_match(t, equation_number);
@@ -654,38 +671,76 @@ void mark_paragraph_starts(std::vector<TextLine>& lines) {
     }
     return mates >= 6 && inset * 5 >= mates * 2 && inset * 5 <= mates * 4;
   };
+  // Captions are set apart from the text: its lines are read past them.
+  auto previous_text_line = [&](size_t i) -> long {
+    for (size_t j = i; j-- > 0;) {
+      if (!lines[j].caption) return static_cast<long>(j);
+    }
+    return -1;
+  };
   for (size_t i = 0; i < lines.size(); ++i) {
     auto& line = lines[i];
     line.para_start = false;
-    if (!line.has_geom || !starts_paragraph_like(line.text)) continue;
-    if (i > 0 && !indented(i) && hanging(i) && lines[i - 1].has_geom &&
-        same_column(lines[i - 1].geom, line.geom) && indented(i - 1)) {
+    if (line.caption || !line.has_geom || !starts_paragraph_like(line.text)) continue;
+    const long p = previous_text_line(i);
+    if (p >= 0 && !indented(i) && hanging(i) && lines[static_cast<size_t>(p)].has_geom &&
+        same_column(lines[static_cast<size_t>(p)].geom, line.geom) && indented(static_cast<size_t>(p))) {
       line.para_start = true;
       continue;
     }
-    if (i == 0) {
+    if (p < 0) {
       line.para_start = indented(i);
       continue;
     }
-    const auto& prev = lines[i - 1];
+    const auto& prev = lines[static_cast<size_t>(p)];
     if (!prev.has_geom || !ends_paragraph_like(prev.text)) continue;
+    const size_t pi = static_cast<size_t>(p);
     const bool column = same_column(prev.geom, line.geom) && prev.geom.y0 < line.geom.y0;
     // An indented first line; not a run of equally indented lines (a
     // quotation, a list, a centred block), nor a hanging entry's
     // continuation.
-    if (indented(i) && !hanging(i) && !(column && indented(i - 1) &&
-                         std::abs(indent_of(i) - indent_of(i - 1)) < em_of(line) * 0.5)) {
+    if (indented(i) && !hanging(i) && !(column && indented(pi) &&
+                         std::abs(indent_of(i) - indent_of(pi)) < em_of(line) * 0.5)) {
       line.para_start = true;
       continue;
     }
     // Flush-left paragraphs: the previous line stops short of the measure,
     // or a blank line's worth of space separates the blocks.
-    if (line_is_short(prev, cols, i - 1)) {
+    if (line_is_short(prev, cols, pi)) {
       line.para_start = true;
       continue;
     }
     if (column && line.block_start && line.geom.y0 - prev.geom.y1 > 0.9 * em_of(line))
       line.para_start = true;
+  }
+}
+
+void join_page_turn_hyphens(std::vector<PageDom>& pages, const Vocabulary& vocab) {
+  TextLine* last = nullptr;
+  for (auto& page : pages) {
+    if (page.wrapper_page || page.lines.empty()) continue;
+    // Running text only: a caption neither ends nor opens a page's text.
+    auto first = std::find_if(page.lines.begin(), page.lines.end(),
+                              [](const TextLine& line) { return !line.caption; });
+    if (last && first != page.lines.end() && last->has_geom && first->has_geom &&
+        ends_with_line_hyphen(last->text) && starts_lowercase(first->text) && first->note_key.empty()) {
+      const auto space = first->text.find(' ');
+      const std::string word = first->text.substr(0, space);
+      const auto last_space = last->text.rfind(' ');
+      const std::string stem = last->text.substr(last_space == std::string::npos ? 0 : last_space + 1);
+      if (!keep_line_end_hyphen(stem.substr(0, stem.size() - 1), word, vocab)) last->text.pop_back();
+      last->text += word;
+      first->text = space == std::string::npos ? std::string() : trim(first->text.substr(space + 1));
+      first->runin_len = first->runin_len > word.size() + 1 ? first->runin_len - (word.size() + 1) : 0;
+      if (first->text.empty()) page.lines.erase(first);
+    }
+    last = nullptr;
+    for (auto it = page.lines.rbegin(); it != page.lines.rend(); ++it) {
+      if (!it->caption) {
+        last = &*it;
+        break;
+      }
+    }
   }
 }
 
