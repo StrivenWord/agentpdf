@@ -688,7 +688,8 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     // own classified words; geometry wins only when clearly cleaner.
     if (family == LayoutFamily::Generic) {
       std::vector<TextLine> box_lines;
-      if (flow_box_lines(flow_text, pd, vocab, box_lines, &pd.footnote_lines)) {
+      if (flow_box_lines(flow_text, pd, vocab, box_lines, &pd.footnote_lines,
+                         pi < front_pages ? &pd.evidence_lines : nullptr)) {
         box_lines = filter_box_chrome_lines(std::move(box_lines), heuristics);
         const bool geometry_cleaner =
             !geometry_lines.empty() && (box_lines.empty() || line_stream_quality(geometry_lines) >

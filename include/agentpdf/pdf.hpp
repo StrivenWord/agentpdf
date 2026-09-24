@@ -60,8 +60,10 @@ bool keep_line_end_hyphen(const std::string& first, const std::string& second,
 // with the text layer (the caller then uses string quarantine).
 // With `notes`, the page's footnote-region words are rebuilt the same way
 // (each note's printed key in TextLine::note_key).
+// With `evidence`, every region's words as reading-order lines (metadata).
 bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Vocabulary& vocab,
-                    std::vector<TextLine>& out, std::vector<TextLine>* notes = nullptr);
+                    std::vector<TextLine>& out, std::vector<TextLine>* notes = nullptr,
+                    std::vector<std::string>* evidence = nullptr);
 // Footnote lines of a page by geometry alone (streams without flow
 // alignment): column by column, top to bottom.
 std::vector<TextLine> footnote_lines_by_geometry(const PageDom& page);

@@ -214,18 +214,20 @@ bool note_key_text(const std::string& text) {
 // own geometry and type.
 std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
                                    const std::vector<NormalizedTextBox>& boxes, RegionKind region,
-                                   const Vocabulary& vocab) {
+                                   const Vocabulary& vocab, bool any_region = false) {
   std::vector<TextLine> out;
-  const bool notes = region == RegionKind::Footnote;
+  const bool notes = region == RegionKind::Footnote && !any_region;
   for (const auto& vl : visual) {
     TextLine line;
     std::string text;
     long previous_kept = -1;
-    double chars = 0, size_sum = 0, size_max = 0, heavy = 0, italic = 0;
+    double chars = 0, size_sum = 0, size_max = 0, heavy = 0, italic = 0, size_min = 0;
     bool first = true;
+    bool leading_heavy = true;  // still inside a bold opening phrase
+    size_t heavy_end = 0;       // text length at its end
     std::vector<size_t> kept;
     for (size_t k : vl.boxes) {
-      if (boxes[k].region == region && !boxes[k].text.empty()) kept.push_back(k);
+      if ((any_region || boxes[k].region == region) && !boxes[k].text.empty()) kept.push_back(k);
     }
     // A footnote's printed key opens its first line: a number or symbol set
     // smaller or higher than the note's text.
@@ -256,7 +258,7 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
           // Exponents stay on their unit ("km2"); other superscript numbers
           // are note or citation markers, resolved once notes are known.
           sep.clear();
-          marker = !notes && !std::regex_search(prev.text, unit_before_exponent());
+          marker = !notes && !any_region && !std::regex_search(prev.text, unit_before_exponent());
         } else if (adjacent && !prev.space_after) {
           sep.clear();
         }
@@ -273,6 +275,8 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
         line.geom = box.box;
         first = false;
       } else {
+        const double em = std::max(4.0, box.type_size > 0 ? box.type_size : box.box.height());
+        if (box.box.x0 - line.geom.x1 > 2.0 * em) line.gapped = true;
         line.geom.x0 = std::min(line.geom.x0, box.box.x0);
         line.geom.x1 = std::max(line.geom.x1, box.box.x1);
         line.geom.y0 = std::min(line.geom.y0, box.box.y0);
@@ -283,11 +287,18 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
         chars += n;
         size_sum += box.type_size * n;
         size_max = std::max(size_max, box.type_size);
+        if (n > 0) size_min = size_min > 0 ? std::min(size_min, box.type_size) : box.type_size;
         if (box.type_heavy) heavy += n;
         if (box.type_italic) italic += n;
+        if (leading_heavy && n > 0) {
+          if (box.type_heavy) heavy_end = text.size();
+          else leading_heavy = false;
+        }
       }
       previous_kept = static_cast<long>(k);
     }
+    // Trailing separators after the bold phrase belong to the text after it.
+    const bool runin = heavy_end > 0 && !leading_heavy;
     text = collapse_ws(text);
     if (text.empty()) continue;
     line.text = text;
@@ -295,8 +306,11 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     if (chars > 0) {
       line.font_size = size_sum / chars;
       line.font_size_max = size_max;
+      line.font_size_min = size_min;
       line.bold = heavy / chars >= 0.6;
+      line.bold_all = heavy >= chars;
       line.italic = italic / chars >= 0.6;
+      if (runin && heavy_end < line.text.size()) line.runin_len = heavy_end;
     }
     line.block_start = vl.block_start;
     out.push_back(std::move(line));
@@ -310,6 +324,7 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     if (cap.font_size <= 0 || next.font_size <= 0 || cap.font_size < next.font_size * 1.8) continue;
     if (!starts_lowercase(next.text)) continue;
     next.text = cap.text + next.text;
+    if (next.runin_len > 0) next.runin_len += cap.text.size();
     next.block_start = next.block_start || cap.block_start;
     cap.text.clear();
   }
@@ -334,16 +349,31 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     auto& a = out[i];
     auto& b = out[i + 1];
     if (!b.note_key.empty()) continue;
-    if (!ends_with_line_hyphen(a.text) || !starts_lowercase(b.text)) continue;
+    if (!ends_with_line_hyphen(a.text) || b.text.empty()) continue;
     const auto space = b.text.find(' ');
     const std::string word = b.text.substr(0, space);
     const auto last_space = a.text.rfind(' ');
     const std::string stem =
         a.text.substr(last_space == std::string::npos ? 0 : last_space + 1);
-    const bool keep = keep_line_end_hyphen(stem.substr(0, stem.size() - 1), word, vocab);
+    bool keep = false;
+    if (starts_lowercase(b.text)) {
+      keep = keep_line_end_hyphen(stem.substr(0, stem.size() - 1), word, vocab);
+    } else if (std::isupper(static_cast<unsigned char>(b.text[0]))) {
+      // A capital after the break: a split acronym ("RD-" + "MA-capable")
+      // joins when the document prints it whole; otherwise the hyphen is
+      // part of a name or compound ("Wilkes-" + "Barre").
+      const auto whole = word_key(stem.substr(0, stem.size() - 1) + word);
+      const auto first_part = word_key(word.substr(0, word.find('-')));
+      if (!vocab.words.count(whole) &&
+          !vocab.words.count(word_key(stem.substr(0, stem.size() - 1)) + first_part))
+        continue;
+    } else {
+      continue;
+    }
     if (!keep) a.text.pop_back();
     a.text += word;
     b.text = space == std::string::npos ? std::string() : trim(b.text.substr(space + 1));
+    b.runin_len = b.runin_len > word.size() + 1 ? b.runin_len - (word.size() + 1) : 0;
   }
   out.erase(std::remove_if(out.begin(), out.end(),
                            [](const TextLine& line) { return line.text.empty(); }),
@@ -377,10 +407,12 @@ LineColumns measure_line_columns(const std::vector<TextLine>& lines) {
     const bool many = left.size() >= 5;
     cols.left[i] = many ? percentile(left, 0.15) : *std::min_element(left.begin(), left.end());
     cols.right[i] = many ? percentile(right, 0.85) : *std::max_element(right.begin(), right.end());
+    // Justified text ends nearly every line at the measure; ragged text
+    // leaves short lines everywhere, which then prove nothing.
     const double em = em_of(lines[i]);
     size_t flush = 0;
-    for (double x : right) flush += x >= cols.right[i] - em ? 1 : 0;
-    cols.justified[i] = right.size() >= 3 && flush * 2 >= right.size();
+    for (double x : right) flush += x >= cols.right[i] - em * 0.25 ? 1 : 0;
+    cols.justified[i] = right.size() >= 3 && flush * 10 >= right.size() * 6;
   }
   return cols;
 }
@@ -397,10 +429,28 @@ void mark_paragraph_starts(std::vector<TextLine>& lines) {
     const double indent = indent_of(i);
     return indent >= 0.6 * em && indent <= 5.0 * em;
   };
+  // Hanging indents (a reference list: entries flush left, their
+  // continuations indented): where most neighbouring lines of the column are
+  // indented, every flush line opens an entry.
+  auto hanging = [&](size_t i) {
+    size_t mates = 0, inset = 0;
+    const size_t from = i >= 8 ? i - 8 : 0;
+    for (size_t j = from; j < lines.size() && j <= i + 8; ++j) {
+      if (!lines[j].has_geom || !same_column(lines[i].geom, lines[j].geom)) continue;
+      ++mates;
+      if (indented(j)) ++inset;
+    }
+    return mates >= 6 && inset * 5 >= mates * 2 && inset * 5 <= mates * 4;
+  };
   for (size_t i = 0; i < lines.size(); ++i) {
     auto& line = lines[i];
     line.para_start = false;
     if (!line.has_geom || !starts_paragraph_like(line.text)) continue;
+    if (i > 0 && !indented(i) && hanging(i) && lines[i - 1].has_geom &&
+        same_column(lines[i - 1].geom, line.geom) && indented(i - 1)) {
+      line.para_start = true;
+      continue;
+    }
     if (i == 0) {
       line.para_start = indented(i);
       continue;
@@ -409,8 +459,9 @@ void mark_paragraph_starts(std::vector<TextLine>& lines) {
     if (!prev.has_geom || !ends_paragraph_like(prev.text)) continue;
     const bool column = same_column(prev.geom, line.geom) && prev.geom.y0 < line.geom.y0;
     // An indented first line; not a run of equally indented lines (a
-    // quotation, a list, a centred block).
-    if (indented(i) && !(column && indented(i - 1) &&
+    // quotation, a list, a centred block), nor a hanging entry's
+    // continuation.
+    if (indented(i) && !hanging(i) && !(column && indented(i - 1) &&
                          std::abs(indent_of(i) - indent_of(i - 1)) < em_of(line) * 0.5)) {
       line.para_start = true;
       continue;
@@ -443,7 +494,8 @@ void mark_page_turn_paragraphs(std::vector<PageDom>& pages) {
 }
 
 bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Vocabulary& vocab,
-                    std::vector<TextLine>& out, std::vector<TextLine>* notes) {
+                    std::vector<TextLine>& out, std::vector<TextLine>* notes,
+                    std::vector<std::string>* evidence) {
   out.clear();
   if (notes) notes->clear();
   const auto& boxes = page.normalized_boxes;
@@ -524,6 +576,11 @@ bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Voc
   out = region_lines(visual, boxes, RegionKind::Body, vocab);
   mark_paragraph_starts(out);
   if (notes) *notes = region_lines(visual, boxes, RegionKind::Footnote, vocab);
+  if (evidence) {
+    evidence->clear();
+    for (auto& line : region_lines(visual, boxes, RegionKind::Body, vocab, /*any_region=*/true))
+      evidence->push_back(std::move(line.text));
+  }
   return true;
 }
 

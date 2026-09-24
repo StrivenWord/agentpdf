@@ -4,6 +4,8 @@
 #include "agentpdf/util.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <cmath>
 #include <regex>
@@ -838,9 +840,23 @@ void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*
         continue;
       }
       if (after_abs && b.kind == BlockKind::Paragraph) {
+        // An abstract may run to several paragraphs (Luo, Kollar's
+        // "Takeaway for practice"): take those set under the label, on its
+        // page, until another heading.
+        // Only when a heading closes them on that page: an article whose
+        // introduction has no heading would otherwise run on into it.
+        std::string text = b.text;
+        const auto at = static_cast<size_t>(&b - page.blocks.data());
+        size_t end = at + 1;
+        while (end < page.blocks.size() && page.blocks[end].kind == BlockKind::Paragraph) ++end;
+        const bool closed = end < page.blocks.size() && page.blocks[end].kind == BlockKind::Heading;
+        for (size_t k = at + 1; closed && k < end; ++k) {
+          if (split_words(text).size() + split_words(page.blocks[k].text).size() > 450) break;
+          text += "\n\n" + page.blocks[k].text;
+        }
         auto words = split_words(b.text);
         if (words.size() >= 40) {
-          dom.meta.abstract_text = b.text;
+          dom.meta.abstract_text = text;
         }
         break;
       }
@@ -889,6 +905,9 @@ void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*
       if (r.segments.size() > 1) ev.front_lines.push_back(joined);
     }
     for (const auto& line : dom.pages[p].lines) ev.front_lines.push_back(line.text);
+    // Rails, history and licence lines have left the body stream; their
+    // reading-order lines are still evidence.
+    for (const auto& line : dom.pages[p].evidence_lines) ev.front_lines.push_back(line);
     if (!masthead_done && !dom.pages[p].wrapper_page) {
       ev.masthead_rows = masthead_candidates(rows, dom.pages[p].height, dom.meta.title);
       masthead_done = true;
@@ -903,6 +922,9 @@ void extract_and_validate_metadata(DocumentDom& dom, const MetadataSpec& /*spec*
     for (const auto& b : page.blocks) {
       if (b.kind == BlockKind::Paragraph) ev.body_text += b.text + ' ';
     }
+  }
+  if (std::getenv("AGENTPDF_DEBUG_META")) {
+    for (const auto& l : ev.front_lines) std::fprintf(stderr, "FRONT| %s\n", l.c_str());
   }
   extract_bibliographic(dom.meta, ev);
 

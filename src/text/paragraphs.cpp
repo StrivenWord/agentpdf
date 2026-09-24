@@ -6,7 +6,11 @@
 #include <cctype>
 #include <optional>
 #include <regex>
+#include <map>
+#include <set>
 #include <sstream>
+#include <tuple>
+#include <cmath>
 
 namespace agentpdf {
 
@@ -62,6 +66,10 @@ bool is_boilerplate_line(const std::string& text) {
   static const char* exact[] = {
       "open access",
       "article",
+      // Journal web furniture printed on the first page (ACS).
+      "access", "read online", "metrics & more", "article recommendations",
+      "access read online", "access metrics & more", "access metrics & more article recommendations",
+      "read online article recommendations",
   };
   for (const char* k : exact) {
     if (low == k) return true;
@@ -106,6 +114,8 @@ bool is_boilerplate_line(const std::string& text) {
       "reproduced with permission of copyright owner",
       "reproduced with permission of the copyright owner",
       "further reproduction prohibited without permission",
+      "notwithstanding the proquest terms and conditions",
+      "you may use this content in accordance with the terms of the",
   };
   for (const char* k : contains) {
     if (low.find(k) != std::string::npos) return true;
@@ -448,6 +458,91 @@ int heading_level_for(const std::string& text, const Heuristics& h, bool magazin
   return 0;
 }
 
+// A heading set only by its type: a short line wholly in bold or in larger
+// type ("The Limits of Land Use Planning", "Recent executive orders",
+// "DESARROLLO."). Its surroundings decide the rest (build_blocks_from_lines).
+bool typeset_heading_line(const TextLine& line, const std::string& text, const DocumentDom& dom) {
+  const double body = dom.body_font_size;
+  if (!line.has_geom || line.gapped || body <= 0 || line.font_size <= 0) return false;
+  const bool heavier = line.bold_all && !dom.body_font_heavy && line.font_size_min >= body * 0.85;
+  const bool larger = line.font_size_min >= body * 1.12;
+  if (!heavier && !larger) return false;
+  const auto words = split_words(text);
+  if (words.empty() || words.size() > 14 || text.size() > 110) return false;
+  int letters = 0, uppers = 0, run = 0;
+  count_letters(text, letters, uppers, run);
+  if (letters < 3 || run < 3 || !starts_like_title(text)) return false;
+  const char last = text.back();
+  if (last == ',' || last == ';' || last == '-') return false;
+  if ((last == '.' || last == '!' || last == '?') && words.size() > 9) return false;
+  if (has_math_notation(text) || looks_like_reference_entry(text) || is_figure_caption(text))
+    return false;
+  return !is_provenance_line(text) && !is_boilerplate_line(text);
+}
+
+// Heading levels by style for headings without a section number: a style
+// that numbered headings also use takes their level; any other ranks below
+// every style more prominent than it (larger, then capitals, then bold).
+struct HeadingStyle {
+  int size = 0;  // half points
+  bool caps = false;
+  bool bold = false;
+  bool operator<(const HeadingStyle& o) const {
+    return std::tie(size, caps, bold) < std::tie(o.size, o.caps, o.bold);
+  }
+};
+
+HeadingStyle style_of(const TextLine& line, const std::string& text) {
+  return {static_cast<int>(std::lround(line.font_size * 2.0)), is_all_capitals(text), line.bold_all};
+}
+
+// Part of the printed title (a title set again on the article's first page
+// after a cover or graphical abstract).
+bool title_fragment(const std::string& text, const DocumentDom& dom) {
+  const auto folded = fold_alnum(text);
+  const auto title = fold_alnum(dom.meta.title);
+  return folded.size() >= 12 && !title.empty() && title.find(folded) != std::string::npos;
+}
+
+std::map<HeadingStyle, int> heading_style_levels(const DocumentDom& dom, const Heuristics& h,
+                                                 size_t first_page, size_t first_line) {
+  std::map<HeadingStyle, std::map<int, int>> numbered;
+  std::set<HeadingStyle> styles;
+  for (const auto& page : dom.pages) {
+    if (page.wrapper_page || static_cast<size_t>(page.index) < first_page) continue;
+    for (size_t li = 0; li < page.lines.size(); ++li) {
+      if (static_cast<size_t>(page.index) == first_page && li < first_line) continue;
+      const auto& line = page.lines[li];
+      const auto text = collapse_ws(normalize_typography(line.text));
+      if (text.empty() || !line.has_geom || title_fragment(text, dom)) continue;
+      HeadingCue cue = HeadingCue::None;
+      const int level = heading_level_for(text, h, false, cue);
+      if (level > 0 && cue == HeadingCue::Numbered && typeset_as_heading(line, text, dom)) {
+        ++numbered[style_of(line, text)][level];
+        styles.insert(style_of(line, text));
+      } else if (typeset_heading_line(line, text, dom)) {
+        styles.insert(style_of(line, text));
+      }
+    }
+  }
+  std::map<HeadingStyle, int> levels;
+  for (const auto& style : styles) {
+    auto it = numbered.find(style);
+    if (it != numbered.end()) {
+      levels[style] = std::max_element(it->second.begin(), it->second.end(), [](const auto& a, const auto& b) {
+                        return a.second < b.second;
+                      })->first;
+      continue;
+    }
+    int above = 0;
+    for (const auto& other : styles) {
+      if (style < other) ++above;
+    }
+    levels[style] = std::min(3, above + 1);
+  }
+  return levels;
+}
+
 std::string strip_glued_heading(const std::string& text, std::string& heading_out,
                                 bool magazine) {
   heading_out.clear();
@@ -639,6 +734,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     }
   }
   const BodyAnchor anchor = find_body_anchor(dom);
+  const auto style_levels = heading_style_levels(dom, heuristics, anchor.page, anchor.line);
   bool body_started = false;
   bool frontiers_wait_for_intro = false;
   bool references_seen = false;
@@ -806,7 +902,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         keyword_list = false;
       }
 
-      if (is_figure_caption(text) && !page.keep_captions) {
+      // Lines rebuilt from classified words have lost their captions to the
+      // float regions already; one opening with "Table 3" is text ("Table 3
+      // depicts…").
+      if (is_figure_caption(text) && !page.keep_captions && !line.has_geom) {
         if (page.layout_family == LayoutFamily::AcmConferenceTwoColumn) {
           flush();
           std::smatch figure_match;
@@ -926,6 +1025,80 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         text = after;
       }
 
+      // A heading set only by type, standing between paragraphs; a second
+      // line in the same style continues it.
+      if (!references_seen && typeset_heading_line(line, text, dom) && title_fragment(text, dom) &&
+          page.index <= static_cast<int>(anchor.page) + 1) {
+        continue;  // the title set again after a cover page
+      }
+      if (!references_seen && typeset_heading_line(line, text, dom)) {
+        // A pull quote: a sentence set large across several lines, repeating
+        // the text it was lifted from. It is not read twice.
+        {
+          std::string quote = text;
+          size_t j = i + 1;
+          while (j < page.lines.size() && j < i + 6 && page.lines[j].has_geom &&
+                 std::abs(page.lines[j].font_size - line.font_size) < 0.3 &&
+                 page.lines[j].bold_all == line.bold_all) {
+            quote += " " + collapse_ws(normalize_typography(page.lines[j].text));
+            ++j;
+          }
+          const auto folded_quote = fold_alnum(quote);
+          if (j - i >= 2 && ends_sentence_like(quote) && folded_quote.size() >= 40) {
+            bool repeated = false;
+            for (const auto& other_page : dom.pages) {
+              std::string body_text;
+              for (size_t k = 0; k < other_page.lines.size(); ++k) {
+                if (&other_page == &page && k >= i && k < j) continue;
+                body_text += fold_alnum(other_page.lines[k].text);
+              }
+              if (body_text.find(folded_quote.substr(0, std::min<size_t>(folded_quote.size(), 60))) !=
+                  std::string::npos) {
+                repeated = true;
+                break;
+              }
+            }
+            if (repeated) {
+              i = j - 1;
+              continue;
+            }
+          }
+        }
+        HeadingCue numbered_cue = HeadingCue::None;
+        const bool numbered = heading_level_for(text, heuristics, false, numbered_cue) > 0 &&
+                              numbered_cue != HeadingCue::Capitals;
+        const bool between = cur.text.empty() || ends_sentence_like(cur.text) ||
+                             cur.text.back() == ':' || line.para_start || line.block_start;
+        if (!numbered && between) {
+          flush();
+          Block hb;
+          hb.kind = BlockKind::Heading;
+          const auto style = style_of(line, text);
+          const auto it = style_levels.find(style);
+          hb.heading_level = it != style_levels.end() ? it->second : 2;
+          hb.text = text;
+          const char last = text.back();
+          if (i + 1 < page.lines.size() && last != '.' && last != ':' && last != '?') {
+            const auto& next = page.lines[i + 1];
+            const auto next_text = collapse_ws(normalize_typography(next.text));
+            // The wrapped rest of the heading ("Resource adequacy and" /
+            // "planning"), in its type, directly below.
+            if (!next_text.empty() && next.has_geom && !next.gapped &&
+                std::lround(next.font_size * 2.0) == style.size && next.bold_all == line.bold_all &&
+                split_words(text).size() + split_words(next_text).size() <= 20 &&
+                next.has_geom && next.geom.y0 - line.geom.y1 < line.font_size * 1.2) {
+              hb.text += " " + next_text;
+              ++i;
+            }
+          }
+          hb.box = line.box;
+          hb.page = page.index;
+          page.blocks.push_back(hb);
+          ++dom.heading_count;
+          continue;
+        }
+      }
+
       HeadingCue cue = HeadingCue::None;
       int hl = heading_level_for(text, heuristics,
                                  page.layout_family == LayoutFamily::MagazineTwoColumn, cue);
@@ -997,6 +1170,18 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         // was skipped.
         gap = line.box.y0 - cur.box.y1;
         if (gap < 0) gap = -gap;
+      }
+      // A paragraph opening with a bold phrase (a run-in heading, "Fast
+      // Storage Enables Large-Scale Query Processing However, …") keeps it
+      // bold, set apart from the sentence it introduces.
+      if (cur.text.empty() && line.runin_len > 0 && line.runin_len < text.size() &&
+          text == collapse_ws(normalize_typography(line.text)) && !dom.body_font_heavy) {
+        const auto phrase = trim(text.substr(0, line.runin_len));
+        const auto phrase_words = split_words(phrase).size();
+        if (phrase_words >= 1 && phrase_words <= 12 && starts_like_title(phrase) &&
+            phrase.find("**") == std::string::npos && !looks_like_reference_entry(phrase)) {
+          text = "**" + phrase + "** " + trim(text.substr(line.runin_len));
+        }
       }
       if (cur.text.empty()) {
         cur.kind = BlockKind::Paragraph;

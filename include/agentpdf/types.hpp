@@ -203,6 +203,13 @@ struct TextLine {
   bool block_start = false;  // first line of one of Poppler's text blocks
   // A footnote line that opens a note: the note's printed key ("3", "*").
   std::string note_key;
+  // Every word heavy; the smallest word size; and the byte length of a bold
+  // phrase the line opens with before regular text (a run-in heading), 0
+  // when there is none.
+  bool bold_all = false;
+  double font_size_min = 0;
+  size_t runin_len = 0;
+  bool gapped = false;  // words set apart by gaps wider than two ems (table cells)
 };
 
 struct Block {
@@ -243,6 +250,9 @@ struct PageDom {
   std::vector<StyledWord> styled_words;  // text-layer order
   std::vector<TextLine> lines;
   std::vector<TextLine> footnote_lines;  // the page's footnotes, in reading order
+  // Every region's words as reading-order lines (flow_box_lines): the
+  // front-matter evidence metadata reads (rails, history, licence lines).
+  std::vector<std::string> evidence_lines;
   std::vector<Block> blocks;
 };
 

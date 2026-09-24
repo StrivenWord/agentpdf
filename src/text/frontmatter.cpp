@@ -279,9 +279,10 @@ bool is_provenance_line(const std::string& line) {
       "received:", "received ", "accepted:", "accepted ", "revised:", "revised ",
       "published online", "available online", "first published", "article history",
       "e-mail:", "e-mail address", "email:", "email address", "*corresponding",
-      "* corresponding", "corresponding author", "to cite this article", "how to cite",
+      "* corresponding", "\xE2\x88\x97 corresponding", "\xE2\x88\x97corresponding",
+      "corresponding author", "to cite this article", "how to cite",
       "cite this article", "citation:", "journal homepage", "contents lists available",
-      "issn", "e-issn", "doi:", "https://doi.org", "http://dx.doi.org", "copyright",
+      "issn", "e-issn", "doi:", "https://doi.org", "http://dx.doi.org", "copyright", "cite this:",
       "this article is licensed", "this is an open access article", "licensee ",
       "contact ", "contact:",
       // Submission history and correspondence in the corpus' other languages.
