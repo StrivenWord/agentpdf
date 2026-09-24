@@ -251,6 +251,9 @@ struct PageDom {
   // before classification.
   std::vector<double> gutters;
   bool gutter_decided = false;
+  // A table runs to this page's foot / continues from the previous page.
+  bool table_open_at_foot = false;
+  bool table_continues = false;
   std::vector<NormalizedTextBox> normalized_boxes;
   std::vector<StyledWord> styled_words;  // text-layer order
   std::vector<TextLine> lines;

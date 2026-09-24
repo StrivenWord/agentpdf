@@ -580,6 +580,29 @@ bool body_like_row(const PageRow& row, double body, const PageColumns& columns, 
   return row.box.width() >= 0.45 * column_width(columns, side);
 }
 
+// Rows of one table: words of the lower row begin where words of the upper
+// one begin (its cells' columns); in prose only the first word of a line
+// does.
+bool aligned_rows(const PageDom& page, const PageRow& upper, const PageRow& lower) {
+  if (upper.boxes.size() < 2 || lower.boxes.size() < 2) return false;
+  // Cell starts: a word set after a gap wider than a word space, at the x
+  // where a word of the upper row starts too.
+  size_t aligned = 0;
+  for (size_t i = 1; i < lower.boxes.size(); ++i) {
+    const auto& word = page.normalized_boxes[lower.boxes[i]];
+    const auto& before = page.normalized_boxes[lower.boxes[i - 1]];
+    const double em = std::max(4.0, word.type_size > 0 ? word.type_size : word.box.height());
+    if (word.box.x0 - before.box.x1 < 0.8 * em) continue;
+    for (size_t j = 1; j < upper.boxes.size(); ++j) {
+      if (std::abs(page.normalized_boxes[upper.boxes[j]].box.x0 - word.box.x0) <= 2.0) {
+        ++aligned;
+        break;
+      }
+    }
+  }
+  return aligned >= 2 || (aligned == 1 && lower.boxes.size() <= 6);
+}
+
 bool heading_like_row(const PageRow& row, double body, bool body_heavy) {
   if (row.words == 0 || row.words > 15 || row.letters < 4 || row.size <= 0) return false;
   return (row.heavy && !body_heavy && row.size >= body * 0.88) || row.size >= body * 1.08;
@@ -853,7 +876,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     // Caption labels in the corpus languages (tabla, figura, tabela,
     // tabella, tablo, şekil, abbildung, tabelle, gráfico, cuadro, quadro).
     static const std::regex caption_word(
-        R"(^(figure|fig\.|table|tab\.|tabla|tabela|tabella|tablo|tabelle|figura|fig|abbildung|abb\.|gr[aá]fico|cuadro|quadro|imagen|imagem|\xC5\x9Fekil)(?:\s+\d+[a-z]?[\.:|]?)?$)",
+        R"(^(figure|fig\.|table|tab\.|tabla|tabela|tabella|tablo|tabelle|figura|fig|abbildung|abb\.|gr[aá]fico|cuadro|quadro|imagen|imagem|\xC5\x9Fekil)(?:\s+(?:[A-Z]\.?)?\d+(?:\.\d+)?[a-z]?[\.:|]?)?$)",
         std::regex::icase);
     if (!std::regex_match(label.text, caption_word)) return false;
     const int side = side_of(columns, label.box);
@@ -863,7 +886,8 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       if (&other == &label || !rows_overlap(label.box, other.box)) continue;
       if (columns.split && side >= 0 && side_of(columns, other.box) != side) continue;
       if (other.box.x1 <= label.box.x0 + 0.5) text_before = true;
-      static const std::regex number_word(R"(^\d+[A-Za-z]?[\.:|]?$)");
+      // "3", "3a.", "B.1", "A3:", "S2" (appendix and supplement numbering).
+      static const std::regex number_word(R"(^(?:[A-Z]\.?)?\d+(?:\.\d+)?[A-Za-z]?[\.:|]?$)");
       if (!number && other.box.x0 >= label.box.x1 - 0.5 && other.box.x0 - label.box.x1 < 45 &&
           std::regex_match(other.text, number_word))
         number = &other;
@@ -1190,8 +1214,13 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
                               seed_low.rfind("quadro", 0) == 0;
       while (i < rows.size()) {
         const auto& row = rows[i];
-        if (has_other_seed(row) || body_like_row(row, body, columns, side)) break;
-        if (heading_like_row(row, body, page.body_font_heavy)) {
+        if (has_other_seed(row)) break;
+        // A table's rows line up with the rows above them even when set in
+        // the body type across the measure.
+        const bool table_row = table_seed && take[prev] && prev != r0 &&
+                               aligned_rows(page, rows[prev], row);
+        if (!table_row && body_like_row(row, body, columns, side)) break;
+        if (!table_row && heading_like_row(row, body, page.body_font_heavy)) {
           const bool introduces_text =
               row.segments <= 1 && i + 1 < rows.size() && body_like_row(rows[i + 1], body, columns, side);
           if (!table_seed || introduces_text) break;
@@ -1218,6 +1247,36 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         if (!take[r]) continue;
         for (size_t k : rows[r].boxes) boxes[k].region = RegionKind::Float;
       }
+    }
+    // A table the previous page left open at its foot continues at the top
+    // of this page's column: aligned rows until running text.
+    if (page.table_continues) {
+      std::vector<size_t> members;
+      for (size_t k = 0; k < boxes.size(); ++k) {
+        const auto& b = boxes[k];
+        if (b.region == RegionKind::Body && b.rotation == 0 && b.box.y0 >= top && b.box.y1 <= bottom)
+          members.push_back(k);
+      }
+      auto rows = page_rows(page, members);
+      size_t end = 0;
+      while (end + 1 < rows.size() && aligned_rows(page, rows[end], rows[end + 1])) ++end;
+      if (end >= 2) {
+        for (size_t r = 0; r <= end; ++r) {
+          for (size_t k : rows[r].boxes) boxes[k].region = RegionKind::Float;
+        }
+      }
+    }
+    // Does a table island here run to the foot of the page?
+    for (size_t seed : typed_seeds) {
+      const auto low = fold_lower_utf8(boxes[seed].text);
+      if (low.rfind("tab", 0) != 0) continue;
+      double lowest = 0, lowest_body = 0;
+      for (const auto& b : boxes) {
+        if (b.box.y1 > bottom) continue;
+        if (b.region == RegionKind::Float) lowest = std::max(lowest, b.box.y1);
+        if (b.region == RegionKind::Body) lowest_body = std::max(lowest_body, b.box.y1);
+      }
+      page.table_open_at_foot = lowest > lowest_body && lowest > page.height * 0.8;
     }
     page.text_quality = score_text_quality(page.normalized_boxes);
     return;

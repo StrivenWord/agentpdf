@@ -1285,6 +1285,30 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
   // Furniture labels whose content was dropped (a masthead line, an
   // aggregator section label) would otherwise end the note.
   if (!dom.pages.empty()) drop_trailing_headings(dom, dom.pages.back().index);
+  // Likewise a graphical abstract's label over its picture (which has no
+  // text), directly followed by the next heading.
+  {
+    static const std::regex graphical(R"(^graphical\s+abstract$)", std::regex::icase);
+    Block* previous = nullptr;
+    for (auto& page : dom.pages) {
+      for (auto& block : page.blocks) {
+        if (previous && previous->kind == BlockKind::Heading && block.kind == BlockKind::Heading &&
+            std::regex_match(trim(previous->text), graphical)) {
+          previous->text.clear();
+        }
+        previous = &block;
+      }
+    }
+    for (auto& page : dom.pages) {
+      const auto before = page.blocks.size();
+      page.blocks.erase(std::remove_if(page.blocks.begin(), page.blocks.end(),
+                                       [](const Block& b) {
+                                         return b.kind == BlockKind::Heading && b.text.empty();
+                                       }),
+                        page.blocks.end());
+      dom.heading_count -= static_cast<int>(before - page.blocks.size());
+    }
+  }
 
   // PDF line/column/page object boundaries are not paragraph boundaries.
   // Rejoin paragraph blocks that were split only because the previous text

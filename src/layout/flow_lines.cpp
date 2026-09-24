@@ -316,6 +316,27 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     out.push_back(std::move(line));
   }
 
+  // Words of one label Poppler read as separate lines on one row
+  // ("GRAPHICAL" "ABSTRACT", "ARTICLE" "INFO", letter-spaced): one line.
+  for (size_t i = 0; i + 1 < out.size(); ++i) {
+    auto& a = out[i];
+    auto& b = out[i + 1];
+    if (a.text.empty() || b.text.empty() || !a.note_key.empty() || !b.note_key.empty()) continue;
+    if (split_words(a.text).size() > 2 || split_words(b.text).size() > 2) continue;
+    const double overlap = std::min(a.geom.y1, b.geom.y1) - std::max(a.geom.y0, b.geom.y0);
+    const double em = std::max(4.0, a.font_size);
+    if (overlap < 0.5 * std::min(a.geom.height(), b.geom.height())) continue;
+    if (b.geom.x0 < a.geom.x1 - 0.5 || b.geom.x0 - a.geom.x1 > 2.0 * em) continue;
+    if (std::abs(a.font_size - b.font_size) > 0.3 || a.bold != b.bold) continue;
+    b.text = a.text + " " + b.text;
+    b.geom.x0 = a.geom.x0;
+    b.geom.y0 = std::min(a.geom.y0, b.geom.y0);
+    b.geom.y1 = std::max(a.geom.y1, b.geom.y1);
+    b.block_start = a.block_start || b.block_start;
+    b.runin_len = 0;
+    a.text.clear();
+  }
+
   // A drop cap Poppler set apart as its own line opens the next line's word.
   for (size_t i = 0; i + 1 < out.size(); ++i) {
     auto& cap = out[i];

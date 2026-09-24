@@ -637,7 +637,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   // cross-page running-header detection.
   decide_document_columns(pages, heuristics);
   bool references_active = false;
-  for (auto& pd : pages) {
+  for (size_t pi = 0; pi < pages.size(); ++pi) {
+    auto& pd = pages[pi];
+    if (pi > 0) pd.table_continues = pages[pi - 1].table_open_at_foot;
     classify_page_regions(pd, heuristics);
     for (const auto& box : pd.normalized_boxes) {
       auto low = to_lower(trim(box.text));
