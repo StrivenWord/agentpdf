@@ -89,6 +89,21 @@ bool same_row(const NormalizedTextBox& a, const NormalizedTextBox& b) {
   return b.box.x0 >= a.box.x0 - 0.5;
 }
 
+// A URL token: it holds a scheme or a domain's slashes.
+bool url_token(const std::string& text) {
+  return text.find("://") != std::string::npos || text.rfind("//", 0) == 0 || text.rfind("www.", 0) == 0 ||
+         (text.find('/') != std::string::npos && text.find('.') != std::string::npos);
+}
+
+// A piece of a URL that runs on: a URL token ending where a URL may be cut
+// (a hyphen, a slash, a dot).
+bool url_fragment(const std::string& text) {
+  if (text.empty()) return false;
+  const char last = text.back();
+  if (last != '-' && last != '/' && last != '.' && last != '_') return false;
+  return url_token(text);
+}
+
 // The rest of a word in small capitals after its full-size capital: set
 // tight against it, in capitals of smaller type, on its baseline.
 bool small_caps_rest(const NormalizedTextBox& capital, const NormalizedTextBox& rest) {
@@ -301,6 +316,13 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
           // are note or citation markers, resolved once notes are known.
           sep.clear();
           marker = !notes && !any_region && !std::regex_search(prev.text, unit_before_exponent());
+        } else if (adjacent && box.box.x0 - prev.box.x1 < 0.3 * std::max(4.0, prev.type_size) &&
+                   (url_fragment(text.substr(text.rfind(' ') == std::string::npos ? 0 : text.rfind(' ') + 1)) ||
+                    (url_token(text.substr(text.rfind(' ') == std::string::npos ? 0 : text.rfind(' ') + 1)) &&
+                     !box.text.empty() && std::string("-/._?&=#").find(box.text[0]) != std::string::npos))) {
+          // A URL Poppler cut at its hyphens and slashes ("//github.com/cloud-"
+          // + "carbon-" + "footprint/…"): one token.
+          sep.clear();
         } else if (adjacent && small_caps_rest(prev, box)) {
           // Small capitals: a word's capital set full size, its rest in
           // smaller capitals ("I" + "NTRODUCTION"), one word however Poppler
@@ -452,6 +474,47 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     a.text += word;
     b.text = space == std::string::npos ? std::string() : trim(b.text.substr(space + 1));
     b.runin_len = b.runin_len > word.size() + 1 ? b.runin_len - (word.size() + 1) : 0;
+  }
+  // A URL's scheme left at a line's end ("https:" + "//github.com/…").
+  for (size_t i = 0; i + 1 < out.size(); ++i) {
+    auto& a = out[i];
+    const auto last_space = a.text.rfind(' ');
+    const std::string token = a.text.substr(last_space == std::string::npos ? 0 : last_space + 1);
+    if (token != "https:" && token != "http:") continue;
+    size_t j = i + 1;
+    while (j < out.size() && out[j].caption != a.caption) ++j;
+    if (j == out.size() || out[j].text.rfind("//", 0) != 0) continue;
+    auto& b = out[j];
+    const auto space = b.text.find(' ');
+    a.text += b.text.substr(0, space);
+    b.text = space == std::string::npos ? std::string() : trim(b.text.substr(space + 1));
+  }
+  // A URL cut at a line's end, anywhere ("…/content/dam" + "/digitalassets/…",
+  // "…/c/da" + "m/m/en…"): the next line's first word runs it on when it is
+  // URL text itself (slashes, dots, hyphens, digits, query marks); a word
+  // after a finished URL ("…/view for details") is not.
+  for (size_t i = 0; i + 1 < out.size(); ++i) {
+    auto& a = out[i];
+    const auto last_space = a.text.rfind(' ');
+    const std::string token = a.text.substr(last_space == std::string::npos ? 0 : last_space + 1);
+    if (token.find("://") == std::string::npos && token.rfind("www.", 0) != 0) continue;
+    if (token.size() < 10 || std::string(",;)").find(token.back()) != std::string::npos) continue;
+    size_t j = i + 1;
+    while (j < out.size() && out[j].caption != a.caption) ++j;
+    if (j == out.size() || !out[j].note_key.empty() || out[j].text.empty()) continue;
+    auto& b = out[j];
+    const auto space = b.text.find(' ');
+    const std::string word = b.text.substr(0, space);
+    // Not a list or reference label ("[33]", "(4)", "12."), nor a number.
+    const bool label = word[0] == '[' || word[0] == '(' ||
+                       std::all_of(word.begin(), word.end(), [](unsigned char c) {
+                         return std::isdigit(c) || c == '.' || c == ',' || c == ')' || c == ']';
+                       });
+    const bool url_text = !label && word.find_first_of("/._-=?&%#0123456789") != std::string::npos &&
+                          !std::isupper(static_cast<unsigned char>(word[0])) && word.find("://") == std::string::npos;
+    if (!url_text) continue;
+    a.text += word;
+    b.text = space == std::string::npos ? std::string() : trim(b.text.substr(space + 1));
   }
   // A URL broken inside a word at the line end ("…/peaclab/Ca" +
   // "rbonMeter."): the next line's first word completes it when the two

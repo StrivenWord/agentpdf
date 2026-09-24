@@ -986,13 +986,17 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       // A reference list's own lines (a DOI or URL wrapped onto its own
       // line, "Available online: …", "(accessed on …)") are its text, not
       // provenance furniture.
+      // An entry's lines carrying its DOI or URL anywhere are its text too
+      // ("Rev 2018;82:1749 - 64. http://dx.doi.org/…, URL https://www.sciencedirect.com/…").
       auto reference_content = [](const std::string& t) {
         const auto l = to_lower(trim(t));
         for (const char* start : {"http", "doi", "www.", "dx.doi", "available online", "available at",
                                   "(accessed", "accessed", "retrieved from"}) {
           if (l.rfind(start, 0) == 0) return true;
         }
-        return false;
+        const bool copyright = l.find("\xC2\xA9") != std::string::npos || l.find("all rights reserved") != std::string::npos;
+        return !copyright && (l.find("doi.org/") != std::string::npos || l.find("doi:") != std::string::npos ||
+                              l.find("http://") != std::string::npos || l.find("https://") != std::string::npos);
       };
       if ((is_boilerplate_line(text) || is_provenance_line(text)) &&
           !(references_seen && reference_content(text)))
