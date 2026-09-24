@@ -1251,6 +1251,32 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       auto& start = typed_footnote_start[static_cast<size_t>(side)];
       start = std::min(start, key.box.y0);
     }
+    // The unkeyed lines that open a column's note block (a corresponding
+    // author's name and address above the keyed affiliations), set in the
+    // notes' type and apart from the text above them.
+    for (size_t side = 0; side < typed_footnote_start.size(); ++side) {
+      double& start = typed_footnote_start[side];
+      if (start > page.height) continue;
+      std::vector<size_t> above;
+      for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
+        const auto& b = page.normalized_boxes[k];
+        if (b.rotation == 0 && b.box.y1 <= start + 1.0 && b.box.y0 >= top &&
+            side_of(columns, b.box) == static_cast<int>(side))
+          above.push_back(k);
+      }
+      const auto rows = page_rows(page, above);
+      double block_top = start;
+      for (size_t r = rows.size(); r-- > 0;) {
+        const auto& row = rows[r];
+        if (row.size <= 0 || row.size > body * 0.9 || block_top - row.box.y1 > 2.0 * row.box.height()) break;
+        const bool text_above = r > 0 && rows[r - 1].size > body * 0.9 && row.box.y0 - rows[r - 1].box.y1 >= body;
+        block_top = row.box.y0;
+        if (text_above) {
+          start = block_top;
+          break;
+        }
+      }
+    }
     // Notes set across the page's full width: a note line that runs on over
     // the gutter (word spacing, not a gutter's gap) opens the next column's
     // footnote area too.
@@ -1439,11 +1465,11 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
   // apart from it by more than its leading. It is not the text; it goes with
   // the page's notes.
   if (typed && page.opening_page) {
+    // Down to the page's edge: a licence's last line can reach the band.
     std::vector<size_t> all;
     for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
       const auto& b = page.normalized_boxes[k];
-      if (b.rotation == 0 && b.box.y0 >= top && b.box.y1 <= bottom && b.region == RegionKind::Body)
-        all.push_back(k);
+      if (b.rotation == 0 && b.box.y0 >= top && b.region == RegionKind::Body) all.push_back(k);
     }
     const bool has_seed = [&] {
       for (size_t k : typed_seeds) {
@@ -1474,6 +1500,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       }
       if (small) {
         for (size_t r = last_body + 1; r < rows.size(); ++r) {
+          if (rows[r].letters == 0) continue;  // a folio: the page's chrome
           for (size_t k : rows[r].boxes) page.normalized_boxes[k].region = RegionKind::Footnote;
         }
       }
