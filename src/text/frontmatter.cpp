@@ -269,9 +269,13 @@ bool is_provenance_line(const std::string& line) {
   // A copyright sign opens licence lines ("© 2026 The Authors", "0018-9162 ©
   // 2026 IEEE") and fills short ones; mid-sentence in prose ("…are ©
   // Copyright 2002 by…") it is only one marker among several.
-  static const std::regex leading_copyright(R"(^([0-9x-]{4,}\s*/?\s*)?(\xC2\xA9|\(c\)))");
+  // "(c)" stands for the sign only before a year or a holder ("(c) 2026",
+  // "(c) The Authors"); a list's third item is "(C) Environmental Fate…".
+  static const std::regex leading_copyright(
+      R"(^([0-9x-]{4,}\s*/?\s*)?(\xC2\xA9|\(c\)\s*(?:(?:19|20)\d{2}|the\s|copyright)))");
+  static const std::regex worded_copyright(R"(\(c\)\s*(?:(?:19|20)\d{2}|the\s|copyright))");
   const bool has_copyright_sign =
-      low.find("\xC2\xA9") != std::string::npos || low.find("(c) ") != std::string::npos;
+      low.find("\xC2\xA9") != std::string::npos || std::regex_search(low, worded_copyright);
   if (std::regex_search(low, leading_copyright)) return true;
   if (has_copyright_sign && words <= 12 && !is_prose_line(line)) return true;
 

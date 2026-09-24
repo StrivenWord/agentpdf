@@ -2138,7 +2138,10 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       if (to_lower(boxes[seed].text).rfind("fig", 0) == 0) {
         for (size_t j = r0; j-- > 0;) {
           const auto& row = rows[j];
-          if (has_other_seed(row) || running_text(row) || heading_like_row(row, body, page.body_font_heavy))
+          // A heading is one run of words; labels spread across the figure
+          // ("On-Site Components  Transmission System  Bulk Generation") are not.
+          if (has_other_seed(row) || running_text(row) ||
+              (row.segments <= 2 && heading_like_row(row, body, page.body_font_heavy)))
             break;
           // The short last line of a paragraph, set close under its text.
           if (j > 0 && row.size > 0 && std::abs(row.size - body) <= body * 0.07 && running_text(rows[j - 1]) &&
