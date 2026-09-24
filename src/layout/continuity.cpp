@@ -671,28 +671,85 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
   }
   if (content_pages == 0) return;
 
-  struct BandLine {
-    std::string signature;
-    std::vector<size_t> boxes;
-    bool top = false;
-    bool folio = false;
-  };
-  auto signature_of = [](const std::string& text) {
-    std::string out;
+  // Signature tokens of a text: lowercase, digit runs as "#", the folio
+  // numbers at either end left out (a page number set close to the title
+  // on some pages and apart on others).
+  auto tokens_of = [](const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
     bool in_digits = false;
+    auto push = [&] {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+    };
     for (unsigned char c : to_lower(text)) {
+      if (std::isspace(c)) {
+        push();
+        in_digits = false;
+        continue;
+      }
       if (std::isdigit(c)) {
-        if (!in_digits) out.push_back('#');
+        if (!in_digits) cur.push_back('#');
         in_digits = true;
         continue;
       }
       in_digits = false;
-      out.push_back(static_cast<char>(c));
+      cur.push_back(static_cast<char>(c));
     }
-    return collapse_ws(out);
+    push();
+    return out;
+  };
+  auto folio_token = [](const std::string& t) {
+    return t.find('#') != std::string::npos &&
+           std::all_of(t.begin(), t.end(), [](char c) { return c == '#' || std::ispunct(static_cast<unsigned char>(c)); });
+  };
+  auto join = [](const std::vector<std::string>& t, size_t from, size_t to) {
+    std::string out;
+    for (size_t i = from; i < to; ++i) {
+      if (!out.empty()) out.push_back(' ');
+      out += t[i];
+    }
+    return out;
   };
 
-  std::vector<std::vector<BandLine>> page_lines(pages.size());
+  // A band part: boxes left to right, their tokens (with each box's share),
+  // and the core signature between the end folios.
+  struct Part {
+    std::vector<size_t> boxes;
+    std::vector<size_t> box_tokens;  // tokens contributed by each box
+    std::vector<std::string> tokens;
+    size_t core_begin = 0, core_end = 0;
+    std::string signature;
+    bool top = false;
+    bool in_strip = true;
+    std::string text;
+  };
+  auto make_part = [&](const PageDom& page, std::vector<size_t> boxes, bool top, double strip_top,
+                       double strip_bottom) {
+    Part part;
+    part.boxes = std::move(boxes);
+    part.top = top;
+    for (size_t bi : part.boxes) {
+      const auto& box = page.normalized_boxes[bi];
+      const auto t = tokens_of(box.text);
+      part.box_tokens.push_back(t.size());
+      part.tokens.insert(part.tokens.end(), t.begin(), t.end());
+      part.text += box.text + ' ';
+      if (top ? box.box.y1 > strip_top : box.box.y0 < strip_bottom) part.in_strip = false;
+    }
+    part.core_begin = 0;
+    part.core_end = part.tokens.size();
+    while (part.core_begin < part.core_end && folio_token(part.tokens[part.core_begin])) ++part.core_begin;
+    while (part.core_end > part.core_begin && folio_token(part.tokens[part.core_end - 1])) --part.core_end;
+    part.signature = join(part.tokens, part.core_begin, part.core_end);
+    return part;
+  };
+
+  // Per page: band rows (one baseline, boxes left to right) and each row's
+  // parts (its folio, title and date set apart; a first page can print a
+  // licence between them).
+  std::vector<std::vector<Part>> page_rows_parts(pages.size());  // rows, then parts, flattened
+  std::vector<std::vector<int>> part_row(pages.size());          // part -> row index (-1: the row itself)
   std::map<std::string, size_t> page_counts;
   for (size_t pi = 0; pi < pages.size(); ++pi) {
     const auto& page = pages[pi];
@@ -702,6 +759,8 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
     // cross-page repetition keeps the wider band safe for body text.
     const double top = page.height * heuristics.header_band_frac * 1.5;
     const double bottom = page.height * (1.0 - heuristics.footer_band_frac * 1.5);
+    const double strip_top = page.height * heuristics.header_band_frac;
+    const double strip_bottom = page.height * (1.0 - heuristics.footer_band_frac);
     std::vector<size_t> band;
     for (size_t bi = 0; bi < page.normalized_boxes.size(); ++bi) {
       const auto& box = page.normalized_boxes[bi].box;
@@ -710,50 +769,136 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
     std::sort(band.begin(), band.end(), [&](size_t a, size_t b) {
       const auto& ba = page.normalized_boxes[a].box;
       const auto& bb = page.normalized_boxes[b].box;
-      if (std::abs(ba.y0 - bb.y0) > 2.5) return ba.y0 < bb.y0;
+      if (ba.y0 != bb.y0) return ba.y0 < bb.y0;
       return ba.x0 < bb.x0;
     });
-    auto& lines = page_lines[pi];
+    std::vector<std::vector<size_t>> rows;
     double line_y = -1e9;
+    bool row_top = false;
     for (size_t bi : band) {
       const auto& box = page.normalized_boxes[bi];
       const bool is_top = box.box.y1 <= top;
-      if (lines.empty() || std::abs(box.box.y0 - line_y) > 2.5 || lines.back().top != is_top) {
-        lines.push_back({{}, {}, is_top});
+      if (rows.empty() || std::abs(box.box.y0 - line_y) > 2.5 || row_top != is_top) {
+        rows.push_back({});
         line_y = box.box.y0;
+        row_top = is_top;
       }
-      lines.back().boxes.push_back(bi);
+      rows.back().push_back(bi);
     }
-    const double strip_top = page.height * heuristics.header_band_frac;
-    const double strip_bottom = page.height * (1.0 - heuristics.footer_band_frac);
+    auto& parts = page_rows_parts[pi];
+    auto& owner = part_row[pi];
     std::set<std::string> seen_here;
-    for (auto& line : lines) {
-      std::string text;
-      bool in_strip_band = true;
-      for (size_t bi : line.boxes) {
-        const auto& box = page.normalized_boxes[bi];
-        text += box.text + ' ';
-        if (line.top ? box.box.y1 > strip_top : box.box.y0 < strip_bottom) in_strip_band = false;
+    for (auto& row : rows) {
+      std::sort(row.begin(), row.end(), [&](size_t a, size_t b) {
+        return page.normalized_boxes[a].box.x0 < page.normalized_boxes[b].box.x0;
+      });
+      const bool is_top = page.normalized_boxes[row.front()].box.y1 <= top;
+      const int row_index = static_cast<int>(parts.size());
+      parts.push_back(make_part(page, row, is_top, strip_top, strip_bottom));
+      owner.push_back(-1);
+      std::vector<std::vector<size_t>> split;
+      double last_x1 = -1e9;
+      for (size_t bi : row) {
+        const auto& box = page.normalized_boxes[bi].box;
+        const double em = std::max(4.0, box.height());
+        if (split.empty() || box.x0 - last_x1 > 2.5 * em) split.push_back({});
+        split.back().push_back(bi);
+        last_x1 = std::max(last_x1, box.x1);
       }
-      line.signature = signature_of(text);
-      line.folio = in_strip_band && (is_folio_line(text) || is_band_furniture_line(text));
-      if (!line.signature.empty() && seen_here.insert(line.signature).second)
-        ++page_counts[line.signature];
+      if (split.size() > 1) {
+        for (auto& piece : split) {
+          parts.push_back(make_part(page, std::move(piece), is_top, strip_top, strip_bottom));
+          owner.push_back(row_index);
+        }
+      }
+    }
+    for (const auto& part : parts) {
+      if (!part.signature.empty() && seen_here.insert(part.signature).second) ++page_counts[part.signature];
     }
   }
 
   const size_t needed = std::max<size_t>(
       2, static_cast<size_t>(std::ceil(static_cast<double>(content_pages) * 0.3)));
+  auto repeated = [&](const std::string& signature) {
+    if (signature.empty() || content_pages < 2) return false;
+    const auto it = page_counts.find(signature);
+    return it != page_counts.end() && it->second >= needed;
+  };
+  auto furniture = [&](const std::string& text) { return is_folio_line(text) || is_band_furniture_line(text); };
+  auto extent = [](const PageDom& page, const std::vector<size_t>& boxes) {
+    BBox b = page.normalized_boxes[boxes.front()].box;
+    for (size_t bi : boxes) {
+      const auto& x = page.normalized_boxes[bi].box;
+      b.x0 = std::min(b.x0, x.x0);
+      b.x1 = std::max(b.x1, x.x1);
+      b.y0 = std::min(b.y0, x.y0);
+      b.y1 = std::max(b.y1, x.y1);
+    }
+    return b;
+  };
   for (size_t pi = 0; pi < pages.size(); ++pi) {
-    for (const auto& line : page_lines[pi]) {
-      if (line.signature.empty()) continue;
-      const bool repeated = content_pages >= 2 && page_counts[line.signature] >= needed;
-      if (!repeated && !line.folio) continue;
-      for (size_t bi : line.boxes) {
-        auto& box = pages[pi].normalized_boxes[bi];
-        if (box.region == RegionKind::Body || box.region == RegionKind::Footnote)
-          box.region = line.top ? RegionKind::Header : RegionKind::Footer;
+    auto& page = pages[pi];
+    const auto& parts = page_rows_parts[pi];
+    std::set<size_t> chrome_boxes;
+    std::vector<std::vector<size_t>> chrome_groups;  // for continuation lines
+    std::vector<bool> group_top;
+    auto mark = [&](const std::vector<size_t>& boxes, bool top) {
+      if (boxes.empty()) return;
+      for (size_t bi : boxes) chrome_boxes.insert(bi);
+      chrome_groups.push_back(boxes);
+      group_top.push_back(top);
+    };
+    for (size_t k = 0; k < parts.size(); ++k) {
+      const auto& part = parts[k];
+      if (part.tokens.empty()) continue;
+      if (repeated(part.signature) || (part.in_strip && furniture(part.text))) {
+        mark(part.boxes, part.top);
+        continue;
       }
+      // A part opening with a running foot's text ("Cell Reports … 2026"
+      // then "© 2026 The Author(s). Published by …"): the foot is chrome, the
+      // rest is judged on its own.
+      size_t best = 0;
+      for (size_t n = part.tokens.size(); n >= 3 && best == 0; --n) {
+        size_t b = 0;
+        while (b < n && folio_token(part.tokens[b])) ++b;
+        size_t e = n;
+        while (e > b && folio_token(part.tokens[e - 1])) --e;
+        if (e - b >= 3 && repeated(join(part.tokens, b, e))) best = n;
+      }
+      if (best == 0) continue;
+      std::vector<size_t> head, rest;
+      size_t seen = 0;
+      std::string rest_text;
+      for (size_t i = 0; i < part.boxes.size(); ++i) {
+        (seen < best ? head : rest).push_back(part.boxes[i]);
+        if (seen >= best) rest_text += page.normalized_boxes[part.boxes[i]].text + ' ';
+        seen += part.box_tokens[i];
+      }
+      mark(head, part.top);
+      if (!rest.empty() && part.in_strip && furniture(rest_text)) mark(rest, part.top);
+    }
+    // A foot's block runs on in the lines set closely under it (a licence
+    // wrapped onto a second line).
+    for (size_t g = 0; g < chrome_groups.size(); ++g) {
+      if (group_top[g]) continue;
+      const BBox a = extent(page, chrome_groups[g]);
+      for (const auto& part : parts) {
+        if (part.top || part.boxes.empty()) continue;
+        if (std::all_of(part.boxes.begin(), part.boxes.end(), [&](size_t bi) { return chrome_boxes.count(bi) > 0; }))
+          continue;
+        const BBox b = extent(page, part.boxes);
+        const double overlap = std::min(a.x1, b.x1) - std::max(a.x0, b.x0);
+        if (b.y0 > a.y0 + 0.5 * a.height() && b.y0 - a.y1 <= 0.6 * a.height() &&
+            overlap >= 0.5 * std::min(a.width(), b.width()) && part.in_strip)
+          for (size_t bi : part.boxes) chrome_boxes.insert(bi);
+      }
+    }
+    const double mid = page.height * 0.5;
+    for (size_t bi : chrome_boxes) {
+      auto& box = page.normalized_boxes[bi];
+      if (box.region == RegionKind::Body || box.region == RegionKind::Footnote)
+        box.region = box.box.cy() < mid ? RegionKind::Header : RegionKind::Footer;
     }
   }
 }
@@ -1226,6 +1371,52 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     }
   }
 
+  // An opening page's foot: a block in smaller type set under all of the
+  // page's text (the authors' addresses, a DOI and version date, a licence),
+  // apart from it by more than its leading. It is not the text; it goes with
+  // the page's notes.
+  if (typed && page.opening_page) {
+    std::vector<size_t> all;
+    for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
+      const auto& b = page.normalized_boxes[k];
+      if (b.rotation == 0 && b.box.y0 >= top && b.box.y1 <= bottom && b.region == RegionKind::Body)
+        all.push_back(k);
+    }
+    const bool has_seed = [&] {
+      for (size_t k : typed_seeds) {
+        if (page.normalized_boxes[k].box.y0 > page.height * 0.5) return true;
+      }
+      return false;
+    }();
+    if (has_seed) all.clear();  // a float's caption can stand at the foot
+    const auto rows = page_rows(page, all);
+    auto body_row = [&](const PageRow& row) {
+      return row.words >= 3 && row.size > 0 &&
+             (std::abs(row.size - body) <= body * 0.07 ||
+              (page_body > 0 && std::abs(row.size - page_body) <= page_body * 0.07));
+    };
+    size_t last_body = rows.size();
+    for (size_t r = rows.size(); r-- > 0;) {
+      if (body_row(rows[r])) {
+        last_body = r;
+        break;
+      }
+    }
+    if (last_body + 1 < rows.size() && rows.size() - last_body - 1 <= 10 &&
+        rows[last_body + 1].box.y0 - rows[last_body].box.y1 >= 1.2 * body) {
+      bool small = true;
+      for (size_t r = last_body + 1; r < rows.size() && small; ++r) {
+        small = rows[r].size > 0 && rows[r].size <= body * 0.9 &&
+                (page_body <= 0 || rows[r].size <= page_body * 0.9);
+      }
+      if (small) {
+        for (size_t r = last_body + 1; r < rows.size(); ++r) {
+          for (size_t k : rows[r].boxes) page.normalized_boxes[k].region = RegionKind::Footnote;
+        }
+      }
+    }
+  }
+
   // Typed pages: a caption's island is its own paragraph (the caption's type
   // and leading), then whatever is not running text below it (a table's
   // body, the material of a figure set under its caption), and for figures
@@ -1245,10 +1436,10 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       // (its lines start at one x, right of the caption): the island ends
       // short of it.
       double bound_x1 = 1e18;
-      // The reach of a line from its first word, by word spacing only: a
-      // gutter is narrow (an em or two), so the next column's text on the
-      // same row must not count.
-      auto reach_from = [&](size_t start, double& beside) {
+      // The reach of a line from its first word, by word spacing only (a
+      // justified line's spaces reach most of an em): a gutter is an em or
+      // two, so the next column's text on the same row must not count.
+      auto reach_from = [&](size_t start, double& beside, double spacing = 1.0) {
         std::vector<size_t> row;
         for (size_t k = 0; k < boxes.size(); ++k) {
           if (boxes[k].rotation == 0 && rows_overlap(boxes[start].box, boxes[k].box) &&
@@ -1261,7 +1452,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         beside = 1e18;
         for (size_t k : row) {
           const double em = std::max(4.0, boxes[k].type_size > 0 ? boxes[k].type_size : body);
-          if (boxes[k].box.x0 - reach > 0.6 * em) {
+          if (boxes[k].box.x0 - reach > spacing * em) {
             beside = boxes[k].box.x0;
             break;
           }
@@ -1365,7 +1556,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
              line_start = next_caption_line(line_start)) {
           chain.push_back(line_start);
           double beside = 1e18;
-          strip_x1 = std::max(strip_x1, reach_from(line_start, beside));
+          strip_x1 = std::max(strip_x1, reach_from(line_start, beside, 1.1));
         }
         const double strip_x0 = boxes[seed].box.x0;
         const double cap_y0 = boxes[chain.front()].box.y0 - 1.0;

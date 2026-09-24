@@ -238,6 +238,7 @@ struct PageDom {
   double height = 0;
   bool used_ocr = false;
   bool wrapper_page = false;
+  bool opening_page = false;  // the first page that is not a wrapper (a cover)
   bool keep_captions = false;
   bool has_region_overrides = false;
   LayoutFamily layout_family = LayoutFamily::Generic;

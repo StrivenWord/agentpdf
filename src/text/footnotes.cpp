@@ -51,6 +51,18 @@ struct Note {
 // Front-matter notes (a corresponding author's address, submission dates, a
 // licence) are provenance, which metadata reads; content notes are kept.
 bool provenance_note(const std::string& text) {
+  // A licence runs long ("© The Author(s) 2026. Open Access This article is
+  // licensed under a Creative Commons …"); it is provenance however long.
+  const auto low = fold_lower_utf8(trim(text));
+  static const char* licence_openings[] = {"\xC2\xA9", "(c) ", "open access", "this article is licensed",
+                                           "this is an open access article", "this article is an open access",
+                                           "copyright"};
+  for (const char* opening : licence_openings) {
+    if (low.rfind(opening, 0) == 0 &&
+        (low.find("licen") != std::string::npos || low.find("creative commons") != std::string::npos ||
+         low.find("rights reserved") != std::string::npos))
+      return true;
+  }
   if (split_words(text).size() > 60) return false;
   return is_provenance_line(text);
 }

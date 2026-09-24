@@ -626,6 +626,11 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   const LayoutFamily family = detect_layout_family(signals);
   for (auto& pd : pages) pd.layout_family = family;
   if (n > 1) pages.front().wrapper_page = is_cover_page(pages.front(), heuristics);
+  for (auto& pd : pages) {
+    if (pd.wrapper_page) continue;
+    pd.opening_page = true;
+    break;
+  }
 
   // The body type, for classification (captions, footnotes and furniture
   // are set apart from it) and heading detection. A scan's text layer is an

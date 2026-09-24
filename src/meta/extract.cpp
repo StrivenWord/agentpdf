@@ -252,28 +252,32 @@ bool title_eligible(const Row& r, double page_height) {
 // page's furniture (top line, citation strip). Adjacency to publisher lines
 // is no evidence: titles routinely sit right under "journal homepage…" or a
 // DOI line.
-bool is_masthead_in_context(const std::vector<Row>& rows, size_t i, double page_height) {
-  const auto self = alnum_fold(rows[i].text);
+// The page's furniture rows (running heads and feet included, whatever
+// region they were given) are the context: a journal's name set large in
+// its masthead recurs in them.
+bool is_masthead_in_context(const Row& row, const std::vector<Row>& context, double page_height) {
+  const auto self = alnum_fold(row.text);
   if (self.size() >= 8) {
-    for (size_t j = 0; j < rows.size(); ++j) {
+    for (const auto& other : context) {
       // Only recurrences in page furniture count; a short title may well be
       // repeated in the body or a caption.
       const bool furniture =
-          rows[j].box.y0 < page_height * 0.12 || rows[j].box.y0 > page_height * 0.88;
-      if (j != i && furniture && alnum_fold(rows[j].text).find(self) != std::string::npos)
-        return true;
+          other.box.y0 < page_height * 0.12 || other.box.y0 > page_height * 0.88;
+      const bool same = std::abs(other.box.y0 - row.box.y0) < 0.5 && other.text == row.text;
+      if (!same && furniture && alnum_fold(other.text).find(self) != std::string::npos) return true;
     }
   }
   return false;
 }
 
-TitleBlock text_layer_title(const std::vector<Row>& rows, double page_height) {
+TitleBlock text_layer_title(const std::vector<Row>& rows, double page_height,
+                            const std::vector<Row>* context = nullptr) {
   TitleBlock tb;
   double best = 0;
   std::vector<bool> eligible(rows.size(), false);
   for (size_t i = 0; i < rows.size(); ++i) {
-    eligible[i] =
-        title_eligible(rows[i], page_height) && !is_masthead_in_context(rows, i, page_height);
+    eligible[i] = title_eligible(rows[i], page_height) &&
+                  !is_masthead_in_context(rows[i], context ? *context : rows, page_height);
     if (eligible[i]) best = std::max(best, rows[i].text_size);
   }
   if (best <= 0) return tb;
@@ -727,7 +731,8 @@ void extract_front_matter_metadata(DocumentDom& dom) {
   for (size_t p = 0; p < dom.front_boxes.size() && p < dom.pages.size(); ++p) {
     if (dom.pages[p].wrapper_page) continue;
     page_height = dom.pages[p].height;
-    title = text_layer_title(rows_of(dom.front_boxes[p], 0.0), page_height);
+    const auto context = rows_of(dom.front_boxes[p], 0.0, /*all_regions=*/true);
+    title = text_layer_title(rows_of(dom.front_boxes[p], 0.0), page_height, &context);
     rows = rows_of(dom.front_boxes[p], 0.8);  // superscript marks dropped for bylines
     if (title.found) break;
   }
@@ -768,9 +773,22 @@ void extract_front_matter_metadata(DocumentDom& dom) {
   // Authors: text-layer names below the title, reconciled with the Info list.
   std::vector<std::string> text_authors;
   if (title.found) text_authors = text_layer_authors(rows, title, page_height);
+  if (std::getenv("AGENTPDF_DEBUG_META")) {
+    std::fprintf(stderr, "TITLE| found=%d y=%.1f-%.1f x=%.1f-%.1f |%s|\n", (int)title.found, title.box.y0, title.box.y1,
+                 title.box.x0, title.box.x1, title.text.c_str());
+    for (const auto& r : rows) {
+      if (r.box.y0 > title.box.y1 - 1 && r.box.y0 < title.box.y1 + 120)
+        std::fprintf(stderr, "ROW| y=%.1f |%s|\n", r.box.y0, r.text.c_str());
+    }
+  }
   double info_ratio = 0;
   auto info_authors = valid_names(split_author_list(dom.info_author), info_ratio);
   if (info_ratio < 1.0) info_authors.clear();  // any junk piece discredits the field
+  if (std::getenv("AGENTPDF_DEBUG_META")) {
+    for (const auto& a : text_authors) std::fprintf(stderr, "TEXT-AUTHOR| %s\n", a.c_str());
+    for (const auto& a : info_authors) std::fprintf(stderr, "INFO-AUTHOR| %s\n", a.c_str());
+    std::fprintf(stderr, "INFO-RAW| %s\n", dom.info_author.c_str());
+  }
   if (!text_authors.empty() && !info_authors.empty()) {
     const bool agree = surname_of(text_authors.front()) == surname_of(info_authors.front());
     dom.meta.authors =
@@ -820,7 +838,7 @@ std::vector<std::string> masthead_candidates(const std::vector<Row>& rows, doubl
     };
     if (i > 0 && i + 1 < rows.size() && furniture(i - 1) && furniture(i + 1)) between.push_back(text);
     else if (is_masthead_row(text)) vocab.push_back(text);
-    else if (is_masthead_in_context(rows, i, page_height)) repeated.push_back(text);
+    else if (is_masthead_in_context(rows[i], rows, page_height)) repeated.push_back(text);
   }
   std::vector<std::string> out;
   for (auto* group : {&between, &vocab, &repeated, &footer})
