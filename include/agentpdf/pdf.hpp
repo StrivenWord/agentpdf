@@ -83,6 +83,9 @@ struct LineColumns {
 LineColumns measure_line_columns(const std::vector<TextLine>& lines);
 // Paragraph starts from page geometry (TextLine::para_start).
 void mark_paragraph_starts(std::vector<TextLine>& lines);
+// A display equation's lines (set off from the text, carrying mathematics
+// or an equation number) as one line of its own (TextLine::equation).
+void group_display_equations(std::vector<TextLine>& lines);
 // A page's first line opens a paragraph when the previous page's last line
 // stopped short after a finished sentence.
 void mark_page_turn_paragraphs(std::vector<PageDom>& pages);

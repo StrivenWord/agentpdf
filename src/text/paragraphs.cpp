@@ -758,6 +758,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     };
 
     bool first_line_of_page = true;
+    bool after_equation = false;
     for (size_t i = 0; i < page.lines.size(); ++i) {
       const auto& line = page.lines[i];
       auto text = collapse_ws(normalize_typography(line.text));
@@ -1213,8 +1214,31 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         continue;
       }
 
+      // A display equation stands between paragraphs, as it is set.
+      if (line.equation) {
+        flush();
+        Block eq;
+        eq.kind = BlockKind::Paragraph;
+        eq.text = text;
+        eq.box = line.box;
+        eq.page = page.index;
+        eq.entry_start = true;
+        page.blocks.push_back(eq);
+        after_equation = true;
+        continue;
+      }
       // Page geometry marks where paragraphs begin (flow_box_lines).
-      if (line.para_start && !cur.text.empty()) flush();
+      if ((line.para_start || after_equation) && !cur.text.empty()) flush();
+      if (after_equation && cur.text.empty()) {
+        // The text resumes under the equation as a paragraph of its own.
+        after_equation = false;
+        cur.kind = BlockKind::Paragraph;
+        cur.text = text;
+        cur.box = line.box;
+        cur.page = page.index;
+        cur.entry_start = true;
+        continue;
+      }
       double gap = 0;
       if (!cur.text.empty()) {
         // Gap against the accumulating paragraph, not raw array adjacency —

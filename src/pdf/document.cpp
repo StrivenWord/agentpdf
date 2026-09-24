@@ -388,9 +388,14 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
       for (const char* weight : {"bold", "black", "heavy", "semibold", "demi"}) {
         if (font.find(weight) != std::string::npos) box.bold = true;
       }
-      for (const char* style : {"italic", "oblique"}) {
+      // Italic faces: "…Italic", "…Oblique", abbreviated "…-Ital"
+      // (URWPalladioL-Ital), "…-It" (MyriadPro-It), "…ItalicMT".
+      for (const char* style : {"ital", "oblique", "slanted"}) {
         if (font.find(style) != std::string::npos) box.italic = true;
       }
+      const auto dash_it = font.rfind("-it");
+      if (dash_it != std::string::npos && (dash_it + 3 == font.size() || !std::isalpha(static_cast<unsigned char>(font[dash_it + 3]))))
+        box.italic = true;
       // Heading faces also come as Medium (IEEE's NimbusRomNo9L-Medi) and
       // abbreviated Semibold (ArnoPro-Smbd).
       word.heavy = box.bold || font.find("medi") != std::string::npos ||

@@ -1,3 +1,4 @@
+#include "agentpdf/frontmatter.hpp"
 #include "agentpdf/pdf.hpp"
 #include "agentpdf/util.hpp"
 
@@ -259,7 +260,12 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
           // are note or citation markers, resolved once notes are known.
           sep.clear();
           marker = !notes && !any_region && !std::regex_search(prev.text, unit_before_exponent());
-        } else if (adjacent && !prev.space_after) {
+        } else if (adjacent && !prev.space_after &&
+                   box.box.x0 - prev.box.x1 < 0.15 * std::max(4.0, prev.type_size > 0 ? prev.type_size
+                                                                                 : prev.box.height())) {
+          // Poppler's word spacing, where the words touch; a visible gap is
+          // a space even where Poppler ended a line there (wide justified
+          // spacing split into lines, then rejoined by row).
           sep.clear();
         }
         text += sep;
@@ -479,6 +485,51 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
   return out;
 }
 
+// Consecutive lines set on one row, side by side (a line Poppler split at a
+// raised or lowered symbol: "by users; PDC,0" + "IT (t) is the…"): one
+// line, words left to right.
+std::vector<VisualLine> merge_row_fragments(std::vector<VisualLine> visual,
+                                            const std::vector<NormalizedTextBox>& boxes) {
+  auto extent = [&](const VisualLine& line) {
+    BBox b = boxes[line.boxes.front()].box;
+    for (size_t k : line.boxes) {
+      const auto& x = boxes[k].box;
+      b.x0 = std::min(b.x0, x.x0);
+      b.x1 = std::max(b.x1, x.x1);
+      b.y0 = std::min(b.y0, x.y0);
+      b.y1 = std::max(b.y1, x.y1);
+    }
+    return b;
+  };
+  std::vector<VisualLine> out;
+  out.reserve(visual.size());
+  for (auto& line : visual) {
+    if (!out.empty() && boxes[line.boxes.front()].rotation == 0 &&
+        boxes[out.back().boxes.front()].rotation == 0) {
+      const BBox a = extent(out.back());
+      const BBox b = extent(line);
+      const double overlap = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+      const double em = std::max(4.0, std::min(a.height(), b.height()));
+      // Side by side, or barely overlapping where a script stacks over
+      // another ("P" with "IT" above "DC,0").
+      const double x_overlap = std::min(a.x1, b.x1) - std::max(a.x0, b.x0);
+      const bool side_by_side = x_overlap <= 1.0 ||
+                                x_overlap <= 0.25 * std::min(a.width(), b.width());
+      const double gap = std::max(0.0, b.x0 >= a.x0 ? b.x0 - a.x1 : a.x0 - b.x1);
+      if (overlap >= 0.5 * std::min(a.height(), b.height()) && side_by_side && gap <= 3.0 * em) {
+        auto& merged = out.back();
+        merged.boxes.insert(merged.boxes.end(), line.boxes.begin(), line.boxes.end());
+        std::stable_sort(merged.boxes.begin(), merged.boxes.end(),
+                         [&](size_t x, size_t y) { return boxes[x].box.x0 < boxes[y].box.x0; });
+        if (merged.flow_line < 0) merged.flow_line = line.flow_line;
+        continue;
+      }
+    }
+    out.push_back(std::move(line));
+  }
+  return out;
+}
+
 }  // namespace
 
 LineColumns measure_line_columns(const std::vector<TextLine>& lines) {
@@ -514,6 +565,72 @@ LineColumns measure_line_columns(const std::vector<TextLine>& lines) {
 
 bool line_is_short(const TextLine& line, const LineColumns& cols, size_t i) {
   return cols.justified[i] && line.geom.x1 < cols.right[i] - 1.5 * em_of(line);
+}
+
+void group_display_equations(std::vector<TextLine>& lines) {
+  if (lines.size() < 2) return;
+  const auto cols = measure_line_columns(lines);
+  static const std::regex equation_number(R"(^\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)$)");
+  static const std::regex trailing_number(R"(\(\s*[A-Z]?\d{1,3}[a-z]?\s*\)$)");
+  auto math_notation = [](const std::string& t) {
+    if (t.find_first_of("=<>^_|") != std::string::npos) return true;
+    for (const char* op : {"\xE2\x88\x91", "\xE2\x88\x8F", "\xE2\x88\xAB", "\xC2\xB1", "\xC3\x97",
+                           "\xE2\x88\x92", "\xE2\x89\xA4", "\xE2\x89\xA5", "\xE2\x88\x88", "\xE2\x88\x80",
+                           "\xE2\x88\x82", "\xCE\xB1", "\xCE\xB2", "\xCE\xB3", "\xCE\xB7", "\xCE\xBB",
+                           "\xCF\x81", "\xCF\x83", "\xCE\xBC", "\xCE\xB5", "\xCE\x94", "\xCE\xB4"}) {
+      if (t.find(op) != std::string::npos) return true;
+    }
+    return false;
+  };
+  // A display line: set off from the column's left edge, not running prose,
+  // carrying mathematics, or a lone equation number at the right.
+  std::vector<bool> display(lines.size(), false);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const auto& l = lines[i];
+    if (!l.has_geom) continue;
+    const auto t = trim(l.text);
+    const double em = em_of(l);
+    const bool number = std::regex_match(t, equation_number);
+    const bool inset = l.geom.x0 > cols.left[i] + 2.5 * em;
+    const size_t words = split_words(t).size();
+    const bool prose = words >= 6 && lowercase_word_share(t) >= 0.6 && !math_notation(t);
+    if (number || (inset && !prose && words <= 16 &&
+                   (math_notation(t) || std::regex_search(t, trailing_number) || words <= 3)))
+      display[i] = true;
+  }
+  // Runs of display lines holding mathematics become one line of their own.
+  std::vector<TextLine> out;
+  out.reserve(lines.size());
+  for (size_t i = 0; i < lines.size();) {
+    if (!display[i]) {
+      out.push_back(std::move(lines[i++]));
+      continue;
+    }
+    size_t j = i;
+    bool maths = false;
+    while (j < lines.size() && display[j]) {
+      const auto t = trim(lines[j].text);
+      if (math_notation(t) || std::regex_search(t, trailing_number)) maths = true;
+      ++j;
+    }
+    if (!maths) {
+      for (; i < j; ++i) out.push_back(std::move(lines[i]));
+      continue;
+    }
+    TextLine eq = std::move(lines[i]);
+    for (size_t k = i + 1; k < j; ++k) {
+      eq.text += " " + lines[k].text;
+      eq.geom.x0 = std::min(eq.geom.x0, lines[k].geom.x0);
+      eq.geom.x1 = std::max(eq.geom.x1, lines[k].geom.x1);
+      eq.geom.y1 = std::max(eq.geom.y1, lines[k].geom.y1);
+    }
+    eq.equation = true;
+    eq.runin_len = 0;
+    out.push_back(std::move(eq));
+    i = j;
+  }
+  lines.swap(out);
+  renumber_synthetic_line_y(lines);
 }
 
 void mark_paragraph_starts(std::vector<TextLine>& lines) {
@@ -673,7 +790,10 @@ bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Voc
   // next column early (a heading beside the text it follows).
   if (!page.gutters.empty()) visual = column_reading_order(std::move(visual), boxes, page.gutters);
 
+  visual = merge_row_fragments(std::move(visual), boxes);
+
   out = region_lines(visual, boxes, RegionKind::Body, vocab);
+  group_display_equations(out);
   mark_paragraph_starts(out);
   if (notes) *notes = region_lines(visual, boxes, RegionKind::Footnote, vocab);
   if (evidence) {

@@ -210,6 +210,7 @@ struct TextLine {
   double font_size_min = 0;
   size_t runin_len = 0;
   bool gapped = false;  // words set apart by gaps wider than two ems (table cells)
+  bool equation = false;  // a display equation, set apart from the text
 };
 
 struct Block {
