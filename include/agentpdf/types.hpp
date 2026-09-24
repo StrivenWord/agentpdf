@@ -246,6 +246,11 @@ struct PageDom {
   // region classification; 0 for scans, whose text layer has one size.
   double body_font_size = 0;
   bool body_font_heavy = false;
+  // x of each gutter between text columns (typed pages), left to right;
+  // none for a page set in one column. Decided for the whole document
+  // before classification.
+  std::vector<double> gutters;
+  bool gutter_decided = false;
   std::vector<NormalizedTextBox> normalized_boxes;
   std::vector<StyledWord> styled_words;  // text-layer order
   std::vector<TextLine> lines;

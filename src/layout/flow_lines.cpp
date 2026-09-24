@@ -384,6 +384,80 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
   return out;
 }
 
+// Visual lines in column reading order: full-width lines (those crossing
+// the gutter) split the page into bands; each band is read left column
+// first, then right, each top to bottom.
+std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
+                                             const std::vector<NormalizedTextBox>& boxes,
+                                             const std::vector<double>& gutters) {
+  struct Placed {
+    BBox box;
+    int side = 0;  // -1 spanning, else the column's index left to right
+    size_t index = 0;
+  };
+  auto column_of = [&](const BBox& b) {
+    int column = 0;
+    for (double g : gutters) {
+      if (b.x1 <= g + 1.0) return column;
+      if (b.x0 < g - 1.0) return -1;
+      ++column;
+    }
+    return column;
+  };
+  std::vector<Placed> placed;
+  placed.reserve(visual.size());
+  for (size_t i = 0; i < visual.size(); ++i) {
+    Placed p;
+    p.index = i;
+    bool first = true;
+    for (size_t k : visual[i].boxes) {
+      const auto& b = boxes[k].box;
+      if (first) p.box = b;
+      p.box.x0 = std::min(p.box.x0, b.x0);
+      p.box.x1 = std::max(p.box.x1, b.x1);
+      p.box.y0 = std::min(p.box.y0, b.y0);
+      p.box.y1 = std::max(p.box.y1, b.y1);
+      first = false;
+    }
+    if (boxes[visual[i].boxes.front()].rotation != 0) {
+      BBox centre{p.box.cx(), p.box.y0, p.box.cx(), p.box.y1};
+      p.side = std::max(0, column_of(centre));
+    } else {
+      p.side = column_of(p.box);
+    }
+    placed.push_back(p);
+  }
+  std::vector<Placed> spanning, columns;
+  for (const auto& p : placed) (p.side < 0 ? spanning : columns).push_back(p);
+  auto by_y = [](const Placed& a, const Placed& b) {
+    if (std::abs(a.box.y0 - b.box.y0) > 1.0) return a.box.y0 < b.box.y0;
+    return a.box.x0 < b.box.x0;
+  };
+  std::sort(spanning.begin(), spanning.end(), by_y);
+  std::vector<bool> used(columns.size(), false);
+  std::vector<VisualLine> out;
+  out.reserve(visual.size());
+  auto emit_band = [&](double limit) {
+    for (int side = 0; side <= static_cast<int>(gutters.size()); ++side) {
+      std::vector<size_t> band;
+      for (size_t c = 0; c < columns.size(); ++c) {
+        if (!used[c] && columns[c].side == side && columns[c].box.cy() < limit) band.push_back(c);
+      }
+      std::sort(band.begin(), band.end(), [&](size_t a, size_t b) { return by_y(columns[a], columns[b]); });
+      for (size_t c : band) {
+        used[c] = true;
+        out.push_back(std::move(visual[columns[c].index]));
+      }
+    }
+  };
+  for (const auto& s : spanning) {
+    emit_band(s.box.y0);
+    out.push_back(std::move(visual[s.index]));
+  }
+  emit_band(1e18);
+  return out;
+}
+
 }  // namespace
 
 LineColumns measure_line_columns(const std::vector<TextLine>& lines) {
@@ -572,6 +646,11 @@ bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Voc
     }
     current.boxes.push_back(k);
   }
+
+  // Two columns: read each band between full-width elements column by
+  // column, top to bottom. Poppler's own order sometimes steps into the
+  // next column early (a heading beside the text it follows).
+  if (!page.gutters.empty()) visual = column_reading_order(std::move(visual), boxes, page.gutters);
 
   out = region_lines(visual, boxes, RegionKind::Body, vocab);
   mark_paragraph_starts(out);

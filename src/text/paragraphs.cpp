@@ -1133,6 +1133,38 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
           hb.text = text;
           hb.box = line.box;
           hb.page = page.index;
+          // The heading's wrapped rest ("2.2. Prospective Electricity
+          // Consumption and Carbon" / "Emissions"): same type, directly
+          // below, not a heading of its own.
+          // A section name ("References") never wraps; a bold run-in heading
+          // ends where the regular text of its last line begins ("…Exposure
+          // Distributions. While spatial…").
+          if (line.has_geom && (cue == HeadingCue::Numbered || cue == HeadingCue::Capitals) &&
+              i + 1 < page.lines.size() && !text.empty() &&
+              std::string(".:?").find(text.back()) == std::string::npos) {
+            auto& next = page.lines[i + 1];
+            const auto next_text = collapse_ws(normalize_typography(next.text));
+            HeadingCue next_cue = HeadingCue::None;
+            const bool next_numbered =
+                heading_level_for(next_text, heuristics, false, next_cue) > 0 &&
+                next_cue == HeadingCue::Numbered;
+            const bool same_type = !next_text.empty() && next.has_geom && !next.gapped &&
+                                   !next_numbered && std::abs(next.font_size - line.font_size) < 0.3 &&
+                                   next.italic == line.italic &&
+                                   next.geom.y0 - line.geom.y1 < line.font_size * 1.2 &&
+                                   !is_bibliography_entry_start(next_text);
+            if (same_type && next.runin_len > 0 && next.runin_len < next_text.size() &&
+                next_text == collapse_ws(normalize_typography(next.text)) && line.bold) {
+              hb.text += " " + trim(next_text.substr(0, next.runin_len));
+              next.text = trim(next_text.substr(next.runin_len));
+              next.runin_len = 0;
+              next.para_start = true;
+            } else if (same_type && next.bold_all == line.bold_all && next.bold == line.bold &&
+                       split_words(next_text).size() <= 12) {
+              hb.text += " " + next_text;
+              ++i;
+            }
+          }
           page.blocks.push_back(hb);
           ++dom.heading_count;
           // Numbered too: "14. REFERENCES".

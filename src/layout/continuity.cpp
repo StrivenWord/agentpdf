@@ -291,26 +291,39 @@ namespace {
 // ---------------------------------------------------------------------------
 
 struct PageColumns {
-  bool split = false;   // two text columns separated by a gutter
-  double gutter = 0;    // x of the gutter's centre
-  double top = 0;       // the band of the page set in two columns (a
-  double bottom = 0;    // full-width title and abstract often sit above it)
+  bool split = false;       // two or more text columns
+  bool both_prose = false;  // running text on both sides of every gutter
+  std::vector<double> gutters;  // x of each gutter's centre, left to right
+  double top = 0;       // the band of the page set in columns (a full-width
+  double bottom = 0;    // title and abstract often sit above it)
   double left = 0;      // text area
   double right = 0;
 };
 
-// Column side of a box: 0 left (or the only column), 1 right, -1 spanning
-// the gutter (a full-width title, abstract, caption or table).
+// Column of a box: its index left to right (0 for a page in one column),
+// -1 when it spans a gutter (a full-width title, abstract, caption, table).
 int side_of(const PageColumns& columns, const BBox& box) {
   if (!columns.split) return 0;
-  if (box.x1 <= columns.gutter + 1.0) return 0;
-  if (box.x0 >= columns.gutter - 1.0) return 1;
-  return -1;
+  int column = 0;
+  for (double g : columns.gutters) {
+    if (box.x1 <= g + 1.0) return column;
+    if (box.x0 < g - 1.0) return -1;
+    ++column;
+  }
+  return column;
+}
+
+int column_count(const PageColumns& columns) {
+  return columns.split ? static_cast<int>(columns.gutters.size()) + 1 : 1;
 }
 
 double column_width(const PageColumns& columns, int side) {
   if (!columns.split || side < 0) return columns.right - columns.left;
-  return side == 0 ? columns.gutter - columns.left : columns.right - columns.gutter;
+  const double from = side == 0 ? columns.left : columns.gutters[static_cast<size_t>(side) - 1];
+  const double to = static_cast<size_t>(side) < columns.gutters.size()
+                        ? columns.gutters[static_cast<size_t>(side)]
+                        : columns.right;
+  return to - from;
 }
 
 bool rows_overlap(const BBox& a, const BBox& b) {
@@ -431,82 +444,125 @@ PageColumns detect_page_columns(const PageDom& page, double top, double bottom) 
     return columns;
   }
   const auto rows = page_rows(page, selected);
+  // Each row's runs of words (gaps wider than an em separate them).
+  struct Run {
+    double x0, x1;
+  };
+  std::vector<std::vector<Run>> runs(rows.size());
+  for (size_t r = 0; r < rows.size(); ++r) {
+    for (size_t k : rows[r].boxes) {
+      const auto& b = page.normalized_boxes[k].box;
+      const double em = std::max(4.0, b.height());
+      if (!runs[r].empty() && b.x0 - runs[r].back().x1 < em) {
+        runs[r].back().x1 = std::max(runs[r].back().x1, b.x1);
+      } else {
+        runs[r].push_back({b.x0, b.x1});
+      }
+    }
+  }
+  const double measure = (columns.right - columns.left) * 0.25;
   constexpr int samples = 160;
   auto sample_x = [&](int i) {
     return page.width * (0.30 + 0.40 * static_cast<double>(i) / (samples - 1));
   };
-  // Per row and sample: 1 the row holds text on both sides and leaves the
-  // sample empty, -1 a row's text runs across it, 0 neither.
-  std::vector<std::vector<signed char>> state(rows.size(), std::vector<signed char>(samples, 0));
-  for (size_t r = 0; r < rows.size(); ++r) {
-    // Word gaps stay under an em; a gutter is wider.
-    std::vector<std::pair<double, double>> segments;
-    for (size_t k : rows[r].boxes) {
-      const auto& b = page.normalized_boxes[k].box;
-      const double em = std::max(4.0, b.height());
-      if (!segments.empty() && b.x0 - segments.back().second < em) {
-        segments.back().second = std::max(segments.back().second, b.x1);
-      } else {
-        segments.emplace_back(b.x0, b.x1);
+  // A gutter at x: rows of text end left of it and rows begin right of it
+  // over a common band of the page (their baselines need not align), prose
+  // on at least one side, and almost no row in that band crosses it.
+  struct Verdict {
+    int score = 0;
+    bool both_prose = false;
+    double top = 0, bottom = 0;
+  };
+  // Rows top to bottom; a row that crosses x ends a stretch.
+  std::vector<size_t> order(rows.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return rows[a].box.cy() < rows[b].box.cy(); });
+  auto evaluate = [&](int i) {
+    const double x = sample_x(i);
+    Verdict best;
+    int n_left = 0, n_right = 0, prose_left = 0, prose_right = 0;
+    double top = 1e18, bottom = -1e18;
+    auto close = [&] {
+      const int fewer = std::min(n_left, n_right);
+      const bool left_prose = prose_left * 2 >= n_left && n_left > 0;
+      const bool right_prose = prose_right * 2 >= n_right && n_right > 0;
+      if (fewer >= 6 && (left_prose || right_prose) && fewer > best.score) {
+        best.score = fewer;
+        best.both_prose = left_prose && right_prose;
+        best.top = top;
+        best.bottom = bottom;
       }
-    }
-    // Running text on at least one side: side-by-side charts and a table's
-    // cells leave gaps too, but not beside a measure of prose.
-    const double measure = (columns.right - columns.left) * 0.25;
-    for (int i = 0; i < samples; ++i) {
-      const double x = sample_x(i);
-      bool inside = false, before = false, after = false, prose = false;
-      for (const auto& [a, z] : segments) {
-        if (a < x && z > x) inside = true;
-        if (z <= x) before = true;
-        if (a >= x) after = true;
-        if ((z <= x || a >= x) && z - a >= measure) prose = true;
+      n_left = n_right = prose_left = prose_right = 0;
+      top = 1e18;
+      bottom = -1e18;
+    };
+    for (size_t r : order) {
+      bool left = false, right = false, cross = false, wide_left = false, wide_right = false;
+      for (const auto& run : runs[r]) {
+        if (run.x0 < x && run.x1 > x) cross = true;
+        else if (run.x1 <= x) {
+          left = true;
+          if (run.x1 - run.x0 >= measure) wide_left = true;
+        } else {
+          right = true;
+          if (run.x1 - run.x0 >= measure) wide_right = true;
+        }
       }
-      state[r][static_cast<size_t>(i)] = inside ? -1 : (before && after && prose ? 1 : 0);
-    }
-  }
-  // The gutter: the sample most rows leave empty, counted over the band
-  // those rows span; within it almost no row may cross.
-  auto evaluate = [&](int i, double& top, double& bottom, int& split, int& cross) {
-    split = cross = 0;
-    top = 1e18;
-    bottom = -1e18;
-    for (size_t r = 0; r < rows.size(); ++r) {
-      if (state[r][static_cast<size_t>(i)] != 1) continue;
-      ++split;
+      if (cross) {
+        close();
+        continue;
+      }
+      if (!left && !right) continue;
+      n_left += left ? 1 : 0;
+      n_right += right ? 1 : 0;
+      prose_left += wide_left ? 1 : 0;
+      prose_right += wide_right ? 1 : 0;
       top = std::min(top, rows[r].box.y0);
       bottom = std::max(bottom, rows[r].box.y1);
     }
-    for (size_t r = 0; r < rows.size(); ++r) {
-      if (state[r][static_cast<size_t>(i)] == -1 && rows[r].box.cy() > top && rows[r].box.cy() < bottom)
-        ++cross;
-    }
+    close();
+    return best;
   };
-  int best = -1, best_split = 0;
-  for (int i = 0; i < samples; ++i) {
-    double t, b;
-    int split, cross;
-    evaluate(i, t, b, split, cross);
-    if (split < 8 || cross * 6 > split) continue;
-    if (split > best_split) {
-      best = i;
-      best_split = split;
+  std::vector<Verdict> verdicts(samples);
+  for (int i = 0; i < samples; ++i) verdicts[static_cast<size_t>(i)] = evaluate(i);
+  // Gutters: the strongest strip, then any other as strong with running text
+  // on both sides, well apart from it (three-column magazines).
+  std::vector<bool> suppressed(samples, false);
+  int first_score = 0;
+  bool all_prose = true;
+  for (int round = 0; round < 3; ++round) {
+    int best = -1;
+    for (int i = 0; i < samples; ++i) {
+      if (suppressed[static_cast<size_t>(i)]) continue;
+      if (verdicts[static_cast<size_t>(i)].score <= 0) continue;
+      if (best < 0 || verdicts[static_cast<size_t>(i)].score > verdicts[static_cast<size_t>(best)].score)
+        best = i;
+    }
+    if (best < 0) break;
+    const auto& v = verdicts[static_cast<size_t>(best)];
+    if (round > 0 && (v.score * 2 < first_score || !v.both_prose)) break;
+    if (round == 0) {
+      first_score = v.score;
+      columns.top = v.top;
+      columns.bottom = v.bottom;
+    }
+    all_prose = all_prose && v.both_prose;
+    auto good = [&](int i) {
+      return !suppressed[static_cast<size_t>(i)] && verdicts[static_cast<size_t>(i)].score * 5 >= v.score * 4;
+    };
+    int first = best, last = best;
+    while (first > 0 && good(first - 1)) --first;
+    while (last + 1 < samples && good(last + 1)) ++last;
+    const double gutter = (sample_x(first) + sample_x(last)) * 0.5;
+    columns.gutters.push_back(gutter);
+    for (int i = 0; i < samples; ++i) {
+      if (std::abs(sample_x(i) - gutter) < page.width * 0.12) suppressed[static_cast<size_t>(i)] = true;
     }
   }
-  if (best < 0) return columns;
-  auto good = [&](int i) {
-    double t, b;
-    int split, cross;
-    evaluate(i, t, b, split, cross);
-    return split * 5 >= best_split * 4 && cross * 6 <= split;
-  };
-  int first = best, last = best;
-  while (first > 0 && good(first - 1)) --first;
-  while (last + 1 < samples && good(last + 1)) ++last;
-  columns.split = true;
-  columns.gutter = (sample_x(first) + sample_x(last)) * 0.5;
-  int split, cross;
-  evaluate(best, columns.top, columns.bottom, split, cross);
+  std::sort(columns.gutters.begin(), columns.gutters.end());
+  columns.split = !columns.gutters.empty();
+  columns.both_prose = columns.split && all_prose;
   return columns;
 }
 
@@ -530,6 +586,42 @@ bool heading_like_row(const PageRow& row, double body, bool body_heavy) {
 }
 
 }  // namespace
+
+void decide_document_columns(std::vector<PageDom>& pages, const Heuristics& heuristics) {
+  // A page with running text on both sides of its gutters is set in
+  // columns. A single gutter with prose on one side only (a table or figure
+  // beside text) counts where other pages of the document are set in
+  // columns at that x; elsewhere it is a table's own gaps on a one-column
+  // page.
+  std::vector<PageColumns> found(pages.size());
+  std::vector<double> gutters;
+  auto typed_generic = [](const PageDom& page) {
+    return !page.wrapper_page && page.body_font_size > 0 && page.layout_family == LayoutFamily::Generic;
+  };
+  for (size_t i = 0; i < pages.size(); ++i) {
+    auto& page = pages[i];
+    if (!typed_generic(page)) continue;
+    const double top = page.height * heuristics.header_band_frac;
+    const double bottom = page.height * (1.0 - heuristics.footer_band_frac);
+    found[i] = detect_page_columns(page, top, bottom);
+    if (found[i].split && found[i].both_prose)
+      gutters.insert(gutters.end(), found[i].gutters.begin(), found[i].gutters.end());
+  }
+  auto supported = [&](double g) {
+    int near = 0;
+    for (double other : gutters) near += std::abs(other - g) <= 15.0 ? 1 : 0;
+    return near >= 2;
+  };
+  for (size_t i = 0; i < pages.size(); ++i) {
+    auto& page = pages[i];
+    if (!typed_generic(page)) continue;
+    const auto& c = found[i];
+    bool accept = c.split && c.both_prose;
+    if (!accept && c.split && c.gutters.size() == 1 && supported(c.gutters.front())) accept = true;
+    page.gutters = accept ? c.gutters : std::vector<double>{};
+    page.gutter_decided = true;
+  }
+}
 
 void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& heuristics) {
   // Running heads/feet repeat across pages with only numbers changing. Any
@@ -713,30 +805,44 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
   const bool typed = page.body_font_size > 0 && page.layout_family == LayoutFamily::Generic;
   const double body = page.body_font_size;
   PageColumns columns;
-  double typed_footnote_start[2] = {page.height + 1, page.height + 1};
-  double col_left[2] = {0, 0};
+  std::vector<double> typed_footnote_start;
+  std::vector<double> col_left;
   if (typed) {
+    // The document-level decision (decide_document_columns) when there is
+    // one; a page alone otherwise.
     columns = detect_page_columns(page, top, bottom);
-    std::vector<double> lefts[2];
+    if (page.gutter_decided) {
+      columns.gutters = page.gutters;
+      columns.split = !columns.gutters.empty();
+    } else {
+      page.gutters = columns.split ? columns.gutters : std::vector<double>{};
+    }
+    const int n_columns = column_count(columns);
+    typed_footnote_start.assign(static_cast<size_t>(n_columns), page.height + 1);
+    col_left.assign(static_cast<size_t>(n_columns), 0);
+    std::vector<std::vector<double>> lefts(static_cast<size_t>(n_columns));
     for (const auto& box : page.normalized_boxes) {
       if (box.rotation != 0 || box.box.y0 < top || box.box.y1 > bottom) continue;
       const int side = side_of(columns, box.box);
-      if (side >= 0) lefts[side].push_back(box.box.x0);
+      if (side >= 0) lefts[static_cast<size_t>(side)].push_back(box.box.x0);
     }
-    for (int side = 0; side < 2; ++side) {
-      auto& xs = lefts[side];
+    for (int side = 0; side < n_columns; ++side) {
+      auto& xs = lefts[static_cast<size_t>(side)];
       if (xs.empty()) {
-        col_left[side] = side == 0 ? columns.left : columns.gutter;
+        col_left[static_cast<size_t>(side)] =
+            side == 0 ? columns.left : columns.gutters[static_cast<size_t>(side) - 1];
         continue;
       }
       std::sort(xs.begin(), xs.end());
-      col_left[side] = xs[xs.size() / 20];
+      col_left[static_cast<size_t>(side)] = xs[xs.size() / 20];
     }
   }
   auto in_typed_footnote_zone = [&](const NormalizedTextBox& box) {
-    int side = side_of(columns, box.box);
-    const double start = side >= 0 ? typed_footnote_start[side]
-                                   : std::min(typed_footnote_start[0], typed_footnote_start[1]);
+    if (typed_footnote_start.empty()) return false;
+    const int side = side_of(columns, box.box);
+    const double start =
+        side >= 0 ? typed_footnote_start[static_cast<size_t>(side)]
+                  : *std::min_element(typed_footnote_start.begin(), typed_footnote_start.end());
     return start <= page.height && box.box.y0 >= start - 1.0;
   };
   // A caption label: "Figure 3." / "Fig. 3" / "TABLE 2" opening its row in
@@ -781,7 +887,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     if (!punctuated) return false;
     // A caption is not indented like a paragraph's first line ("Fig. 10.
     // Comparative analysis…" opening a paragraph of running text).
-    const double column_left = side >= 0 ? col_left[side] : col_left[0];
+    const double column_left = side >= 0 ? col_left[static_cast<size_t>(side)] : col_left[0];
     if (label.box.x0 > column_left + body * 0.6) return false;
     // Punctuation alone: a caption stands apart from the text above it.
     double above = -1;
@@ -839,7 +945,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       if (!is_digits(key.text) || key.text.size() > 2) continue;
       if (key.box.y0 < page.height * 0.60 || key.box.y1 > bottom) continue;
       const int side = side_of(columns, key.box);
-      if (side < 0 || key.box.x0 > col_left[side] + 1.5 * body) continue;
+      if (side < 0 || key.box.x0 > col_left[static_cast<size_t>(side)] + 1.5 * body) continue;
       const bool small_key = (key.type_size > 0 && key.type_size <= body * 0.85) ||
                              (median_height > 0 && key.box.height() < median_height * 0.82);
       if (!small_key) continue;
@@ -870,7 +976,8 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         return label.box.y0 > key.box.y1 && (label_side == side || label_side < 0);
       });
       if (above_caption) continue;
-      typed_footnote_start[side] = std::min(typed_footnote_start[side], key.box.y0);
+      auto& start = typed_footnote_start[static_cast<size_t>(side)];
+      start = std::min(start, key.box.y0);
     }
   }
   auto is_caption_seed = [&](const NormalizedTextBox& candidate) {

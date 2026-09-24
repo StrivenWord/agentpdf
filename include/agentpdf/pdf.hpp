@@ -29,6 +29,9 @@ struct LayoutSignals {
 LayoutFamily detect_layout_family(const LayoutSignals& signals);
 // Repository cover sheets and pictorial title pages carry no article body.
 bool is_cover_page(const PageDom& page, const Heuristics& heuristics);
+// Two text columns, page by page, decided for the whole document
+// (PageDom::gutter) before regions are classified.
+void decide_document_columns(std::vector<PageDom>& pages, const Heuristics& heuristics);
 // Mark header/footer-band lines that recur across pages as chrome.
 void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& heuristics);
 double score_text_quality(const std::vector<NormalizedTextBox>& boxes);

@@ -633,7 +633,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     }
   }
 
-  // Pass 3: region classification, then cross-page running-header detection.
+  // Pass 3: columns for the whole document, region classification, then
+  // cross-page running-header detection.
+  decide_document_columns(pages, heuristics);
   bool references_active = false;
   for (auto& pd : pages) {
     classify_page_regions(pd, heuristics);
