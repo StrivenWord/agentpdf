@@ -248,6 +248,224 @@ bool is_folio_line(const std::string& text) {
 
 }  // namespace
 
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Page structure from geometry and type, for pages whose text layer says how
+// it is typeset (PageDom::body_font_size > 0).
+// ---------------------------------------------------------------------------
+
+struct PageColumns {
+  bool split = false;   // two text columns separated by a gutter
+  double gutter = 0;    // x of the gutter's centre
+  double top = 0;       // the band of the page set in two columns (a
+  double bottom = 0;    // full-width title and abstract often sit above it)
+  double left = 0;      // text area
+  double right = 0;
+};
+
+// Column side of a box: 0 left (or the only column), 1 right, -1 spanning
+// the gutter (a full-width title, abstract, caption or table).
+int side_of(const PageColumns& columns, const BBox& box) {
+  if (!columns.split) return 0;
+  if (box.x1 <= columns.gutter + 1.0) return 0;
+  if (box.x0 >= columns.gutter - 1.0) return 1;
+  return -1;
+}
+
+double column_width(const PageColumns& columns, int side) {
+  if (!columns.split || side < 0) return columns.right - columns.left;
+  return side == 0 ? columns.gutter - columns.left : columns.right - columns.gutter;
+}
+
+bool rows_overlap(const BBox& a, const BBox& b) {
+  const double overlap = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+  return overlap >= 0.35 * std::max(0.1, std::min(a.height(), b.height()));
+}
+
+struct PageRow {
+  std::vector<size_t> boxes;  // left to right
+  BBox box;
+  double size = 0;            // character-weighted type size
+  double max_size = 0;
+  size_t words = 0;
+  size_t letters = 0;
+  size_t digits = 0;
+  size_t lower_words = 0;
+  bool heavy = false;
+  bool italic = false;
+  std::string text;
+};
+
+// Rows (shared baselines) of the selected boxes, top to bottom.
+std::vector<PageRow> page_rows(const PageDom& page, const std::vector<size_t>& selected) {
+  std::vector<size_t> order = selected;
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return page.normalized_boxes[a].box.cy() < page.normalized_boxes[b].box.cy();
+  });
+  std::vector<PageRow> rows;
+  for (size_t k : order) {
+    const auto& box = page.normalized_boxes[k].box;
+    if (!rows.empty() && rows_overlap(rows.back().box, box)) {
+      auto& row = rows.back();
+      row.boxes.push_back(k);
+      row.box.x0 = std::min(row.box.x0, box.x0);
+      row.box.x1 = std::max(row.box.x1, box.x1);
+      row.box.y0 = std::min(row.box.y0, box.y0);
+      row.box.y1 = std::max(row.box.y1, box.y1);
+      continue;
+    }
+    PageRow row;
+    row.boxes.push_back(k);
+    row.box = box;
+    rows.push_back(std::move(row));
+  }
+  for (auto& row : rows) {
+    std::sort(row.boxes.begin(), row.boxes.end(), [&](size_t a, size_t b) {
+      return page.normalized_boxes[a].box.x0 < page.normalized_boxes[b].box.x0;
+    });
+    double chars = 0, sum = 0, heavy = 0, italic = 0;
+    for (size_t k : row.boxes) {
+      const auto& b = page.normalized_boxes[k];
+      if (!row.text.empty()) row.text.push_back(' ');
+      row.text += b.text;
+      const double n = static_cast<double>(std::max<size_t>(1, fold_alnum(b.text).size()));
+      if (b.type_size > 0) {
+        chars += n;
+        sum += b.type_size * n;
+        row.max_size = std::max(row.max_size, b.type_size);
+        if (b.type_heavy) heavy += n;
+        if (b.type_italic) italic += n;
+      }
+      for (const auto& w : split_words(b.text)) {
+        ++row.words;
+        if (std::islower(static_cast<unsigned char>(w.front()))) ++row.lower_words;
+      }
+      for (unsigned char c : b.text) {
+        if (std::isalpha(c) || c >= 0xC0) ++row.letters;
+        else if (std::isdigit(c)) ++row.digits;
+      }
+    }
+    if (chars > 0) {
+      row.size = sum / chars;
+      row.heavy = heavy / chars >= 0.6;
+      row.italic = italic / chars >= 0.6;
+    }
+  }
+  return rows;
+}
+
+// Two text columns show as a vertical strip near the page centre that many
+// rows leave empty while holding text on both sides of it, and that almost
+// no row crosses.
+PageColumns detect_page_columns(const PageDom& page, double top, double bottom) {
+  PageColumns columns;
+  std::vector<size_t> selected;
+  columns.left = page.width;
+  columns.right = 0;
+  for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
+    const auto& b = page.normalized_boxes[k];
+    if (b.rotation != 0 || b.text.empty() || b.box.y0 < top || b.box.y1 > bottom) continue;
+    selected.push_back(k);
+    columns.left = std::min(columns.left, b.box.x0);
+    columns.right = std::max(columns.right, b.box.x1);
+  }
+  if (selected.size() < 40 || columns.right <= columns.left) {
+    columns.left = 0;
+    columns.right = page.width;
+    return columns;
+  }
+  const auto rows = page_rows(page, selected);
+  constexpr int samples = 160;
+  auto sample_x = [&](int i) {
+    return page.width * (0.30 + 0.40 * static_cast<double>(i) / (samples - 1));
+  };
+  // Per row and sample: 1 the row holds text on both sides and leaves the
+  // sample empty, -1 a row's text runs across it, 0 neither.
+  std::vector<std::vector<signed char>> state(rows.size(), std::vector<signed char>(samples, 0));
+  for (size_t r = 0; r < rows.size(); ++r) {
+    // Word gaps stay under an em; a gutter is wider.
+    std::vector<std::pair<double, double>> segments;
+    for (size_t k : rows[r].boxes) {
+      const auto& b = page.normalized_boxes[k].box;
+      const double em = std::max(4.0, b.height());
+      if (!segments.empty() && b.x0 - segments.back().second < em) {
+        segments.back().second = std::max(segments.back().second, b.x1);
+      } else {
+        segments.emplace_back(b.x0, b.x1);
+      }
+    }
+    for (int i = 0; i < samples; ++i) {
+      const double x = sample_x(i);
+      bool inside = false, before = false, after = false;
+      for (const auto& [a, z] : segments) {
+        if (a < x && z > x) inside = true;
+        if (z <= x) before = true;
+        if (a >= x) after = true;
+      }
+      state[r][static_cast<size_t>(i)] = inside ? -1 : (before && after ? 1 : 0);
+    }
+  }
+  // The gutter: the sample most rows leave empty, counted over the band
+  // those rows span; within it almost no row may cross.
+  auto evaluate = [&](int i, double& top, double& bottom, int& split, int& cross) {
+    split = cross = 0;
+    top = 1e18;
+    bottom = -1e18;
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (state[r][static_cast<size_t>(i)] != 1) continue;
+      ++split;
+      top = std::min(top, rows[r].box.y0);
+      bottom = std::max(bottom, rows[r].box.y1);
+    }
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (state[r][static_cast<size_t>(i)] == -1 && rows[r].box.cy() > top && rows[r].box.cy() < bottom)
+        ++cross;
+    }
+  };
+  int best = -1, best_split = 0;
+  for (int i = 0; i < samples; ++i) {
+    double t, b;
+    int split, cross;
+    evaluate(i, t, b, split, cross);
+    if (split < 8 || cross * 6 > split) continue;
+    if (split > best_split) {
+      best = i;
+      best_split = split;
+    }
+  }
+  if (best < 0) return columns;
+  auto good = [&](int i) {
+    double t, b;
+    int split, cross;
+    evaluate(i, t, b, split, cross);
+    return split * 5 >= best_split * 4 && cross * 6 <= split;
+  };
+  int first = best, last = best;
+  while (first > 0 && good(first - 1)) --first;
+  while (last + 1 < samples && good(last + 1)) ++last;
+  columns.split = true;
+  columns.gutter = (sample_x(first) + sample_x(last)) * 0.5;
+  int split, cross;
+  evaluate(best, columns.top, columns.bottom, split, cross);
+  return columns;
+}
+
+bool body_like_row(const PageRow& row, double body, const PageColumns& columns, int side) {
+  if (row.words < 4 || row.size <= 0) return false;
+  if (std::abs(row.size - body) > body * 0.07) return false;
+  if (row.digits * 2 > row.letters) return false;
+  return row.box.width() >= 0.45 * column_width(columns, side);
+}
+
+bool heading_like_row(const PageRow& row, double body, bool body_heavy) {
+  if (row.words == 0 || row.words > 15 || row.letters < 4 || row.size <= 0) return false;
+  return (row.heavy && !body_heavy && row.size >= body * 0.88) || row.size >= body * 1.08;
+}
+
+}  // namespace
+
 void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& heuristics) {
   // Running heads/feet repeat across pages with only numbers changing. Any
   // header/footer-band line whose digit-normalised text recurs on several
@@ -340,7 +558,7 @@ void mark_repeated_page_chrome(std::vector<PageDom>& pages, const Heuristics& he
       if (!repeated && !line.folio) continue;
       for (size_t bi : line.boxes) {
         auto& box = pages[pi].normalized_boxes[bi];
-        if (box.region == RegionKind::Body)
+        if (box.region == RegionKind::Body || box.region == RegionKind::Footnote)
           box.region = line.top ? RegionKind::Header : RegionKind::Footer;
       }
     }
@@ -424,6 +642,131 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
                                                   : footnote_start_right;
     start = std::min(start, box.box.y0);
   }
+  // Typed pages of unknown templates: columns from the page geometry,
+  // footnote keys that start a line of smaller type at their column's left
+  // edge. The named families keep their own tuned rules (and overrides).
+  const bool typed = page.body_font_size > 0 && page.layout_family == LayoutFamily::Generic;
+  const double body = page.body_font_size;
+  PageColumns columns;
+  double typed_footnote_start[2] = {page.height + 1, page.height + 1};
+  double col_left[2] = {0, 0};
+  if (typed) {
+    columns = detect_page_columns(page, top, bottom);
+    std::vector<double> lefts[2];
+    for (const auto& box : page.normalized_boxes) {
+      if (box.rotation != 0 || box.box.y0 < top || box.box.y1 > bottom) continue;
+      const int side = side_of(columns, box.box);
+      if (side >= 0) lefts[side].push_back(box.box.x0);
+    }
+    for (int side = 0; side < 2; ++side) {
+      auto& xs = lefts[side];
+      if (xs.empty()) {
+        col_left[side] = side == 0 ? columns.left : columns.gutter;
+        continue;
+      }
+      std::sort(xs.begin(), xs.end());
+      col_left[side] = xs[xs.size() / 20];
+    }
+  }
+  auto in_typed_footnote_zone = [&](const NormalizedTextBox& box) {
+    int side = side_of(columns, box.box);
+    const double start = side >= 0 ? typed_footnote_start[side]
+                                   : std::min(typed_footnote_start[0], typed_footnote_start[1]);
+    return start <= page.height && box.box.y0 >= start - 1.0;
+  };
+  // A caption label: "Figure 3." / "Fig. 3" / "TABLE 2" opening its row in
+  // its column, told from a sentence that opens with a reference ("Table 3
+  // shows…") by its type or by punctuation after a gap.
+  auto is_typed_caption_seed = [&](size_t index) {
+    const auto& label = page.normalized_boxes[index];
+    static const std::regex caption_word(R"(^(figure|fig\.|table)(?:\s+\d+[a-z]?[\.:|]?)?$)",
+                                         std::regex::icase);
+    if (!std::regex_match(label.text, caption_word)) return false;
+    const int side = side_of(columns, label.box);
+    const NormalizedTextBox* number = nullptr;
+    bool text_before = false;
+    for (const auto& other : page.normalized_boxes) {
+      if (&other == &label || !rows_overlap(label.box, other.box)) continue;
+      if (columns.split && side >= 0 && side_of(columns, other.box) != side) continue;
+      if (other.box.x1 <= label.box.x0 + 0.5) text_before = true;
+      static const std::regex number_word(R"(^\d+[A-Za-z]?[\.:|]?$)");
+      if (!number && other.box.x0 >= label.box.x1 - 0.5 && other.box.x0 - label.box.x1 < 45 &&
+          std::regex_match(other.text, number_word))
+        number = &other;
+    }
+    const bool numbered = number || std::regex_search(label.text, std::regex(R"(\d)"));
+    if (!numbered || text_before) return false;
+    static const std::regex punctuated_number(R"(\d[A-Za-z]?[\.:|]$)");
+    const bool punctuated = std::regex_search(number ? number->text : label.text, punctuated_number);
+    int letters = 0, uppers = 0;
+    for (unsigned char c : label.text) {
+      if (std::isalpha(c)) {
+        ++letters;
+        if (std::isupper(c)) ++uppers;
+      }
+    }
+    const bool capitals = letters >= 3 && uppers == letters;
+    const bool typographic = (label.type_size > 0 && label.type_size < body * 0.95) ||
+                             (label.type_heavy && !page.body_font_heavy) || capitals ||
+                             label.type_italic;
+    if (typographic) return true;
+    if (!punctuated) return false;
+    // Punctuation alone: a caption stands apart from the text above it.
+    double above = -1;
+    for (const auto& other : page.normalized_boxes) {
+      if (other.box.y1 > label.box.y0 + 0.5 || rows_overlap(other.box, label.box)) continue;
+      if (columns.split && side >= 0 && side_of(columns, other.box) != side) continue;
+      if (other.box.x1 < label.box.x0 - 5 || other.box.x0 > label.box.x0 + column_width(columns, side))
+        continue;
+      above = std::max(above, other.box.y1);
+    }
+    return above < 0 || label.box.y0 - above > body * 1.0;
+  };
+  // Footnote keys (typed pages), once caption labels are known: a figure's
+  // numbers above its caption are not notes.
+  if (typed) {
+    std::vector<size_t> caption_labels;
+    for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
+      if (is_typed_caption_seed(k)) caption_labels.push_back(k);
+    }
+    for (const auto& key : page.normalized_boxes) {
+      if (!is_digits(key.text) || key.text.size() > 2) continue;
+      if (key.box.y0 < page.height * 0.60 || key.box.y1 > bottom) continue;
+      const int side = side_of(columns, key.box);
+      if (side < 0 || key.box.x0 > col_left[side] + 1.5 * body) continue;
+      const bool small_key = (key.type_size > 0 && key.type_size <= body * 0.85) ||
+                             (median_height > 0 && key.box.height() < median_height * 0.82);
+      if (!small_key) continue;
+      const bool follows_word = std::any_of(
+          page.normalized_boxes.begin(), page.normalized_boxes.end(), [&](const auto& other) {
+            return &other != &key && other.box.y0 < key.box.y1 && other.box.y1 > key.box.y0 &&
+                   other.box.x1 <= key.box.x0 + 0.5 && other.box.x1 >= key.box.x0 - 6.0;
+          });
+      if (follows_word) continue;
+      // The note itself, to the key's right, is words set smaller than the
+      // body (not a figure's axis numbers).
+      double chars = 0, sum = 0;
+      size_t letters = 0, words = 0;
+      for (const auto& other : page.normalized_boxes) {
+        if (&other == &key || other.type_size <= 0 || !rows_overlap(key.box, other.box)) continue;
+        if (other.box.x0 < key.box.x1 - 0.5 || side_of(columns, other.box) != side) continue;
+        const double n = static_cast<double>(std::max<size_t>(1, other.text.size()));
+        chars += n;
+        sum += other.type_size * n;
+        ++words;
+        for (unsigned char c : other.text) letters += (std::isalpha(c) || c >= 0xC0) ? 1 : 0;
+      }
+      if (chars == 0 || sum / chars > body * 0.93) continue;
+      if (words < 2 || static_cast<double>(letters) < chars * 0.5) continue;
+      const bool above_caption = std::any_of(caption_labels.begin(), caption_labels.end(), [&](size_t c) {
+        const auto& label = page.normalized_boxes[c];
+        const int label_side = side_of(columns, label.box);
+        return label.box.y0 > key.box.y1 && (label_side == side || label_side < 0);
+      });
+      if (above_caption) continue;
+      typed_footnote_start[side] = std::min(typed_footnote_start[side], key.box.y0);
+    }
+  }
   auto is_caption_seed = [&](const NormalizedTextBox& candidate) {
     const auto low = to_lower(candidate.text);
     static const std::regex caption_word(
@@ -455,6 +798,7 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     return has_number_after && !has_text_before;
   };
 
+  std::vector<size_t> typed_seeds;
   for (auto& box : page.normalized_boxes) {
     box.text = collapse_ws(normalize_typography(box.text));
     const auto low = to_lower(box.text);
@@ -511,17 +855,27 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       continue;
     }
     if (page.layout_family != LayoutFamily::AcmConferenceTwoColumn &&
-        !page.keep_captions && is_caption_seed(box)) {
+        !page.keep_captions &&
+        (typed ? is_typed_caption_seed(static_cast<size_t>(&box - page.normalized_boxes.data()))
+               : is_caption_seed(box))) {
       box.region = RegionKind::Float;
+      typed_seeds.push_back(static_cast<size_t>(&box - page.normalized_boxes.data()));
       continue;
     }
-    const bool left_half = box.box.cx() < page.width * 0.5;
-    const double footnote_start =
-        left_half ? footnote_start_left : footnote_start_right;
-    if (footnote_start <= page.height &&
-        box.box.y0 >= footnote_start - 1.0) {
-      box.region = RegionKind::Footnote;
-      continue;
+    if (typed) {
+      if (in_typed_footnote_zone(box)) {
+        box.region = RegionKind::Footnote;
+        continue;
+      }
+    } else {
+      const bool left_half = box.box.cx() < page.width * 0.5;
+      const double footnote_start =
+          left_half ? footnote_start_left : footnote_start_right;
+      if (footnote_start <= page.height &&
+          box.box.y0 >= footnote_start - 1.0) {
+        box.region = RegionKind::Footnote;
+        continue;
+      }
     }
     if (page.layout_family == LayoutFamily::FrontiersRail && page.index == 0 &&
         box.box.x1 <= page.width * heuristics.sidebar_max_width_frac) {
@@ -558,6 +912,90 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
         box.font_size < median_font * 0.82) {
       box.region = RegionKind::Footnote;
     }
+  }
+
+  // Typed pages: a caption's island is its own paragraph (the caption's type
+  // and leading), then whatever is not running text below it (a table's
+  // body, the material of a figure set under its caption), and for figures
+  // the non-text material above the caption: axis labels, legends. Running
+  // text in the body type ends it, in the caption's own column.
+  if (typed) {
+    auto& boxes = page.normalized_boxes;
+    auto is_seed = [&](size_t k) {
+      return std::find(typed_seeds.begin(), typed_seeds.end(), k) != typed_seeds.end();
+    };
+    for (size_t seed : typed_seeds) {
+      const int side = side_of(columns, boxes[seed].box);
+      std::vector<size_t> members;
+      for (size_t k = 0; k < boxes.size(); ++k) {
+        const auto& b = boxes[k];
+        if (b.region != RegionKind::Body && b.region != RegionKind::Float) continue;
+        if (b.rotation != 0 || b.box.y0 < top || b.box.y1 > bottom) continue;
+        const int other = side_of(columns, b.box);
+        if (columns.split && side >= 0 && other >= 0 && other != side) continue;
+        members.push_back(k);
+      }
+      auto rows = page_rows(page, members);
+      size_t r0 = rows.size();
+      for (size_t r = 0; r < rows.size() && r0 == rows.size(); ++r) {
+        if (std::find(rows[r].boxes.begin(), rows[r].boxes.end(), seed) != rows[r].boxes.end()) r0 = r;
+      }
+      if (r0 == rows.size()) continue;
+      auto has_other_seed = [&](const PageRow& row) {
+        return std::any_of(row.boxes.begin(), row.boxes.end(),
+                           [&](size_t k) { return k != seed && is_seed(k); });
+      };
+      std::vector<bool> take(rows.size(), false);
+      take[r0] = true;
+      const double caption_size = rows[r0].size > 0 ? rows[r0].size : body;
+      const bool body_size_caption = std::abs(caption_size - body) <= body * 0.05;
+      size_t i = r0 + 1, prev = r0;
+      while (i < rows.size()) {
+        const auto& row = rows[i];
+        if (has_other_seed(row)) break;
+        const double gap = row.box.y0 - rows[prev].box.y1;
+        if (row.size <= 0 || std::abs(row.size - caption_size) > caption_size * 0.08 ||
+            gap > caption_size * 0.8)
+          break;
+        // A caption in the body type ends with its sentence; the text that
+        // follows it closely is the body again.
+        const auto last = trim(rows[prev].text);
+        if (body_size_caption && !last.empty() && last.back() == '.' &&
+            body_like_row(row, body, columns, side))
+          break;
+        take[i] = true;
+        prev = i++;
+      }
+      while (i < rows.size()) {
+        const auto& row = rows[i];
+        if (has_other_seed(row) || body_like_row(row, body, columns, side) ||
+            heading_like_row(row, body, page.body_font_heavy))
+          break;
+        if (row.box.y0 - rows[prev].box.y1 > body * 6) break;
+        take[i] = true;
+        prev = i++;
+      }
+      if (to_lower(boxes[seed].text).rfind("fig", 0) == 0) {
+        for (size_t j = r0; j-- > 0;) {
+          const auto& row = rows[j];
+          if (has_other_seed(row) || body_like_row(row, body, columns, side) ||
+              heading_like_row(row, body, page.body_font_heavy))
+            break;
+          // The short last line of a paragraph, set close under its text.
+          if (j > 0 && row.size > 0 && std::abs(row.size - body) <= body * 0.07 &&
+              body_like_row(rows[j - 1], body, columns, side) &&
+              row.box.y0 - rows[j - 1].box.y1 <= body * 0.6)
+            break;
+          take[j] = true;
+        }
+      }
+      for (size_t r = 0; r < rows.size(); ++r) {
+        if (!take[r]) continue;
+        for (size_t k : rows[r].boxes) boxes[k].region = RegionKind::Float;
+      }
+    }
+    page.text_quality = score_text_quality(page.normalized_boxes);
+    return;
   }
 
   // Expand a caption seed into its complete float island. This prevents a

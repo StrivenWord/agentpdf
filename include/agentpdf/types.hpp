@@ -145,6 +145,13 @@ struct NormalizedTextBox {
   int rotation = 0;
   int column = 0;
   RegionKind region = RegionKind::Body;
+  // The word's type as set. Unlike font_size/bold/italic above, which body
+  // classification runs without, these are kept for every page: line
+  // typography and sub/superscript joins read them.
+  double type_size = 0;
+  bool type_heavy = false;
+  bool type_italic = false;
+  bool space_after = true;  // Poppler's own word spacing after this word
 };
 
 enum class BlockKind {
@@ -186,6 +193,16 @@ struct TextLine {
   double font_size_max = 0;
   bool bold = false;
   bool italic = false;
+  // Lines rebuilt from their own text-layer words (flow_box_lines) carry the
+  // words' real page geometry here; `box` holds stream coordinates.
+  BBox geom;
+  bool has_geom = false;
+  // Page geometry says a paragraph begins here: an indented first line, or
+  // a line after a short sentence-final one.
+  bool para_start = false;
+  bool block_start = false;  // first line of one of Poppler's text blocks
+  // A footnote line that opens a note: the note's printed key ("3", "*").
+  std::string note_key;
 };
 
 struct Block {
@@ -198,6 +215,10 @@ struct Block {
   // Opens a numbered bibliography entry or list item: never joined to the
   // paragraph before it, however that one ends.
   bool entry_start = false;
+  // Page geometry: the block's first line opens a paragraph (never joined to
+  // the one before), or visibly continues the previous page's paragraph.
+  bool para_start = false;
+  bool continues = false;
   std::vector<std::vector<std::string>> table_rows;
 };
 
@@ -214,9 +235,14 @@ struct PageDom {
   double detected_skew_deg = 0.0;  // Detected skew from Leptonica analysis (OCR pages only)
   std::optional<double> column_cut_override;
   std::vector<BBox> ocr_content_regions;  // Content bounding boxes from Leptonica
+  // The document's body type (DocumentDom::body_font_size), known before
+  // region classification; 0 for scans, whose text layer has one size.
+  double body_font_size = 0;
+  bool body_font_heavy = false;
   std::vector<NormalizedTextBox> normalized_boxes;
   std::vector<StyledWord> styled_words;  // text-layer order
   std::vector<TextLine> lines;
+  std::vector<TextLine> footnote_lines;  // the page's footnotes, in reading order
   std::vector<Block> blocks;
 };
 
@@ -240,6 +266,8 @@ struct DocumentDom {
   bool body_font_heavy = false;
   std::vector<PageDom> pages;
   std::vector<std::string> endnotes;
+  // Pandoc label of each endnote ("3", "3-p7"); empty means its position.
+  std::vector<std::string> endnote_labels;
   int heading_count = 0;
   int table_count = 0;
   int figure_count = 0;

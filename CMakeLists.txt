@@ -30,6 +30,7 @@ set(AGENTPDF_SOURCES
   src/index/job_index.cpp
   src/pdf/document.cpp
   src/layout/continuity.cpp
+  src/layout/flow_lines.cpp
   src/layout/leptonica_analyze.cpp
   src/ocr/tesseract_page.cpp
   src/text/paragraphs.cpp

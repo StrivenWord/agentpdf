@@ -117,7 +117,9 @@ std::string assemble_markdown(const DocumentDom& dom, const Heuristics& heuristi
     if (!seen_refs) body << "\n";
     body << "\n";
     for (size_t i = 0; i < dom.endnotes.size(); ++i) {
-      body << "[^" << (i + 1) << "]: " << dom.endnotes[i] << "\n\n";
+      const bool labelled = i < dom.endnote_labels.size() && !dom.endnote_labels[i].empty();
+      body << "[^" << (labelled ? dom.endnote_labels[i] : std::to_string(i + 1)) << "]: "
+           << dom.endnotes[i] << "\n\n";
     }
   }
 

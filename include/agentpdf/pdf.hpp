@@ -3,6 +3,7 @@
 #include "agentpdf/types.hpp"
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace poppler {
@@ -41,6 +42,45 @@ std::vector<TextLine> quarantine_stream_lines(
     const Heuristics& heuristics);
 void stitch_document_lines(DocumentDom& dom, const Heuristics& heuristics);
 void renumber_synthetic_line_y(std::vector<TextLine>& lines);
+
+// Words the document prints whole (lowercase; compounds keep their inner
+// hyphen), the evidence for line-end hyphen decisions.
+struct Vocabulary {
+  std::unordered_set<std::string> words;
+};
+Vocabulary build_vocabulary(const std::vector<PageDom>& pages);
+// "first-" ending a line and "second" opening the next: a hyphenated
+// compound (keep the hyphen) or one word broken by the typesetter?
+bool keep_line_end_hyphen(const std::string& first, const std::string& second,
+                          const Vocabulary& vocab);
+// Poppler's reading-order text rebuilt from the page's own text-layer
+// words: each word keeps the region its box was classified into, so
+// non-body text leaves the stream word by word, and every line carries its
+// words' real geometry and type. False when the flow text does not align
+// with the text layer (the caller then uses string quarantine).
+// With `notes`, the page's footnote-region words are rebuilt the same way
+// (each note's printed key in TextLine::note_key).
+bool flow_box_lines(const std::string& flow_text, const PageDom& page, const Vocabulary& vocab,
+                    std::vector<TextLine>& out, std::vector<TextLine>* notes = nullptr);
+// Footnote lines of a page by geometry alone (streams without flow
+// alignment): column by column, top to bottom.
+std::vector<TextLine> footnote_lines_by_geometry(const PageDom& page);
+// Group every page's footnote lines into notes (DocumentDom::endnotes),
+// and turn the body's superscript markers that name one into Pandoc note
+// references ("[^3]"); other markers become plain numbers again.
+void link_note_markers(DocumentDom& dom);
+// Column measure of each line (its left and right edges, and whether the
+// column is set justified), from the lines sharing its horizontal span.
+struct LineColumns {
+  std::vector<double> left, right;
+  std::vector<bool> justified;
+};
+LineColumns measure_line_columns(const std::vector<TextLine>& lines);
+// Paragraph starts from page geometry (TextLine::para_start).
+void mark_paragraph_starts(std::vector<TextLine>& lines);
+// A page's first line opens a paragraph when the previous page's last line
+// stopped short after a finished sentence.
+void mark_page_turn_paragraphs(std::vector<PageDom>& pages);
 
 bool rasterize_page_raw(const std::string& path, int page_index, int dpi,
                         std::vector<unsigned char>& raw_argb, int& width, int& height,

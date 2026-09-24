@@ -284,6 +284,30 @@ std::vector<TextLine> filter_chrome_lines(std::vector<TextLine> lines, const Heu
   return out;
 }
 
+// Text rules for lines rebuilt from classified words (flow_box_lines).
+// Geometry has already placed every word, so only furniture that escapes
+// the header/footer bands is left: bare page numbers, page labels ("Page 3
+// of 10", "2 of 17") and lone ornaments. Journal names, volume lines and
+// DOIs are not matched as text here: in the body they are references.
+std::vector<TextLine> filter_box_chrome_lines(std::vector<TextLine> lines, const Heuristics& h) {
+  static const std::regex page_label(R"(^(?:page\s+)?\d{1,4}\s+(?:of|/)\s+\d{1,4}$|^page\s+\d{1,4}$)",
+                                     std::regex::icase);
+  std::vector<TextLine> out;
+  out.reserve(lines.size());
+  for (auto& line : lines) {
+    const auto t = trim(line.text);
+    if (t.empty()) continue;
+    if (h.strip_page_numbers && is_mostly_digits(t) && t.size() <= 3) continue;
+    if (h.strip_page_numbers && std::regex_match(t, page_label)) continue;
+    if (t.size() == 1 && !std::isdigit(static_cast<unsigned char>(t[0]))) {
+      const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(t[0])));
+      if (c != 'a' && c != 'i') continue;
+    }
+    out.push_back(std::move(line));
+  }
+  return out;
+}
+
 struct OcrJob {
   int page_index = 0;
   bool candidate = false;  // true: compare OCR against native lines; false: use OCR directly
@@ -355,6 +379,7 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
     box.box = BBox{rect.x(), rect.y(), rect.x() + rect.width(),
                    rect.y() + rect.height()};
     box.rotation = source.rotation();
+    box.space_after = source.has_space_after();
     StyledWord word;
     word.folded = fold_alnum(box.text);
     if (source.has_font_info()) {
@@ -372,6 +397,9 @@ std::vector<NormalizedTextBox> collect_normalized_boxes(poppler::page& page,
                    font.find("smbd") != std::string::npos;
       word.italic = box.italic;
       word.font_size = box.font_size;
+      box.type_size = word.font_size;
+      box.type_heavy = word.heavy;
+      box.type_italic = word.italic;
     }
     if (!word.folded.empty()) styled.push_back(std::move(word));
     result.push_back(std::move(box));
@@ -433,6 +461,7 @@ void annotate_line_typography(PageDom& page) {
   };
   size_t cursor = 0;
   for (auto& line : page.lines) {
+    if (line.has_geom) continue;  // typed from its own words already
     const auto key = fold_alnum(normalize_typography(line.text));
     if (key.size() < 3) continue;
     size_t pos = find_aligned(key, cursor);
@@ -593,6 +622,17 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
   for (auto& pd : pages) pd.layout_family = family;
   if (n > 1) pages.front().wrapper_page = is_cover_page(pages.front(), heuristics);
 
+  // The body type, for classification (captions, footnotes and furniture
+  // are set apart from it) and heading detection. A scan's text layer is an
+  // invisible OCR font of uniform size, which says nothing.
+  if (family != LayoutFamily::ScanOcrTwoColumn) {
+    measure_body_font(result.dom);
+    for (auto& pd : pages) {
+      pd.body_font_size = result.dom.body_font_size;
+      pd.body_font_heavy = result.dom.body_font_heavy;
+    }
+  }
+
   // Pass 3: region classification, then cross-page running-header detection.
   bool references_active = false;
   for (auto& pd : pages) {
@@ -608,6 +648,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     if (references_active) mark_post_references_ancillary(pd, true);
   }
   mark_repeated_page_chrome(pages, heuristics);
+
+  // Line-end hyphen evidence: every word the document prints whole.
+  const Vocabulary vocab = build_vocabulary(pages);
 
   // Pass 4: choose and normalize each page's line stream.
   std::vector<OcrJob> ocr_jobs;
@@ -640,6 +683,19 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     } catch (...) {
       flow_text.clear();
       raw_text.clear();
+    }
+    // Unknown templates read Poppler's reading order rebuilt from the page's
+    // own classified words; geometry wins only when clearly cleaner.
+    if (family == LayoutFamily::Generic) {
+      std::vector<TextLine> box_lines;
+      if (flow_box_lines(flow_text, pd, vocab, box_lines, &pd.footnote_lines)) {
+        box_lines = filter_box_chrome_lines(std::move(box_lines), heuristics);
+        const bool geometry_cleaner =
+            !geometry_lines.empty() && (box_lines.empty() || line_stream_quality(geometry_lines) >
+                                                                 line_stream_quality(box_lines) + 0.05);
+        pd.lines = geometry_cleaner ? std::move(geometry_lines) : std::move(box_lines);
+        continue;
+      }
     }
     auto flow_lines =
         filter_chrome_lines(lines_from_reading_order_text(flow_text), heuristics, magazine);
@@ -693,6 +749,9 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
         heuristics.ocr_when_scan_present) {
       ocr_jobs.push_back({pi, true});
     }
+    // Footnotes leave the stream with their region; they are kept to become
+    // endnotes (a scan's are read from its OCR text, not here).
+    if (family != LayoutFamily::ScanOcrTwoColumn) pd.footnote_lines = footnote_lines_by_geometry(pd);
   }
 
   // Run all collected OCR work in parallel using the configured worker count.
@@ -733,15 +792,14 @@ ExtractResult extract_pdf_dom(const std::string& path, const Heuristics& heurist
     }
   }
 
+  if (heuristics.footnotes_to_endnotes) link_note_markers(result.dom);
   stitch_document_lines(result.dom, heuristics);
+  mark_page_turn_paragraphs(pages);
 
-  // Typographic evidence for heading detection. A scan's text layer is an
-  // invisible OCR font of uniform size, which says nothing about headings.
-  if (family != LayoutFamily::ScanOcrTwoColumn) {
-    measure_body_font(result.dom);
-    if (result.dom.body_font_size > 0) {
-      for (auto& pd : pages) annotate_line_typography(pd);
-    }
+  // Typographic evidence for heading detection (lines rebuilt from their own
+  // words carry it already).
+  if (result.dom.body_font_size > 0) {
+    for (auto& pd : pages) annotate_line_typography(pd);
   }
   for (auto& pd : pages) {
     pd.styled_words.clear();

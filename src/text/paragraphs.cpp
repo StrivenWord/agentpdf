@@ -37,6 +37,9 @@ namespace {
 
 bool ends_sentence_like(const std::string& text) {
   auto t = trim(text);
+  // A trailing note reference ("…precedent.[^1]") follows the terminator.
+  static const std::regex note_ref(R"(\[\^[^\]\s]+\]$)");
+  t = std::regex_replace(t, note_ref, "");
   if (t.empty()) return false;
   // Ignore trailing closers/quotes after the terminator.
   size_t i = t.size();
@@ -380,7 +383,9 @@ bool typeset_as_heading(const TextLine& line, const std::string& text, const Doc
 
 int heading_level_for(const std::string& text, const Heuristics& h, bool magazine,
                       HeadingCue& cue) {
-  auto t = trim(text);
+  // Note references ("Introduction[^1]") are not part of the title.
+  static const std::regex note_ref(R"(\[\^[^\]\s]+\])");
+  auto t = trim(std::regex_replace(text, note_ref, ""));
   auto low = to_lower(t);
   cue = HeadingCue::Label;
   // "Appendix", "Appendix A", "Appendix B. Technical data"; not prose that
@@ -656,12 +661,17 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
       cur.page = page.index;
     };
 
+    bool first_line_of_page = true;
     for (size_t i = 0; i < page.lines.size(); ++i) {
       const auto& line = page.lines[i];
       auto text = collapse_ws(normalize_typography(line.text));
       text = strip_inline_figure_noise(text);
       if (text.empty()) continue;
       auto low = to_lower(text);
+      // Only the page's first line (by position) can continue the previous
+      // page's paragraph.
+      const bool page_opening = first_line_of_page;
+      first_line_of_page = false;
 
       if (references_seen &&
           (drop_ancillary || is_post_references_ancillary_start(text))) {
@@ -947,7 +957,14 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         }
       }
 
-      if (likely_footnote_line(text) && line.box.y0 > 0 && i + 2 >= page.lines.size()) {
+      // A footnote is set smaller than the body; body-size lines that open
+      // with a number ("2021 to over 440 MW…") are text.
+      // Lines rebuilt from classified words never are one: their footnotes
+      // were read from the footnote region (link_note_markers).
+      const bool small_type = line.font_size <= 0 || dom.body_font_size <= 0 ||
+                              line.font_size < dom.body_font_size * 0.92;
+      if (!line.has_geom && likely_footnote_line(text) && line.box.y0 > 0 &&
+          i + 2 >= page.lines.size() && small_type) {
         flush();
         Block fb;
         fb.kind = BlockKind::Footnote;
@@ -971,6 +988,8 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         continue;
       }
 
+      // Page geometry marks where paragraphs begin (flow_box_lines).
+      if (line.para_start && !cur.text.empty()) flush();
       double gap = 0;
       if (!cur.text.empty()) {
         // Gap against the accumulating paragraph, not raw array adjacency —
@@ -984,6 +1003,10 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
         cur.text = text;
         cur.box = line.box;
         cur.page = page.index;
+        cur.para_start = line.para_start;
+        // The page's first line, not a paragraph start: the previous page's
+        // paragraph runs on, even across a sentence end.
+        cur.continues = line.has_geom && !line.para_start && page_opening;
       } else if (gap > heuristics.paragraph_gap_pts &&
                  ends_sentence_like(cur.text)) {
         // Large synthetic gaps often come from Poppler blank lines or column
@@ -1041,7 +1064,7 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     merged.reserve(page.blocks.size());
     for (auto& block : page.blocks) {
       if (!merged.empty() && merged.back().kind == BlockKind::Paragraph &&
-          block.kind == BlockKind::Paragraph && !block.entry_start &&
+          block.kind == BlockKind::Paragraph && !block.entry_start && !block.para_start &&
           !ends_sentence_like(merged.back().text)) {
         append_paragraph(merged.back(), block);
         continue;
@@ -1057,7 +1080,8 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     auto& a = prev.blocks.back();
     auto& b = cur.blocks.front();
     if (a.kind != BlockKind::Paragraph || b.kind != BlockKind::Paragraph) continue;
-    if (b.entry_start || ends_sentence_like(a.text)) continue;
+    if (b.entry_start || b.para_start) continue;
+    if (ends_sentence_like(a.text) && !b.continues) continue;
     append_paragraph(a, b);
     cur.blocks.erase(cur.blocks.begin());
   }
@@ -1098,6 +1122,7 @@ void isolate_footnotes(DocumentDom& dom, const Heuristics& heuristics) {
     for (auto& b : page.blocks) {
       if (b.kind == BlockKind::Footnote) {
         dom.endnotes.push_back(b.text);
+        dom.endnote_labels.emplace_back();
         ++dom.footnote_count;
       } else {
         kept.push_back(std::move(b));
