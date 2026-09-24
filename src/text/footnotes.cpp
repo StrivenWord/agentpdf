@@ -250,6 +250,9 @@ void link_note_markers(DocumentDom& dom) {
   for (const auto& note : notes) {
     const auto label = label_of(note);
     if (note.page == first_page && !referenced.count(label) && affiliation_like(note.text)) continue;
+    // An unkeyed line or two under the opening page's text (a corresponding
+    // author's name over the address) is front matter.
+    if (note.page == first_page && note.key.empty() && split_words(note.text).size() <= 8) continue;
     dom.endnotes.push_back(trim(note.text));
     dom.endnote_labels.push_back(label);
   }
