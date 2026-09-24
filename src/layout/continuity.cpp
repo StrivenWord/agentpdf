@@ -1000,8 +1000,13 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
     for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
       if (is_typed_caption_seed(k)) caption_labels.push_back(k);
     }
+    auto key_text = [](const std::string& text) {
+      if (is_digits(text)) return text.size() <= 2;
+      return text == "*" || text == "**" || text == "\xE2\x80\xA0" || text == "\xE2\x80\xA1" ||
+             text == "\xC2\xA7" || text == "\xC2\xB6" || text == "\xE2\x88\x97";  // † ‡ § ¶ ∗
+    };
     for (const auto& key : page.normalized_boxes) {
-      if (!is_digits(key.text) || key.text.size() > 2) continue;
+      if (!key_text(key.text)) continue;
       if (key.box.y0 < page.height * 0.60 || key.box.y1 > bottom) continue;
       const int side = side_of(columns, key.box);
       if (side < 0 || key.box.x0 > col_left[static_cast<size_t>(side)] + 1.5 * body) continue;
@@ -1037,6 +1042,37 @@ void classify_page_regions(PageDom& page, const Heuristics& heuristics) {
       if (above_caption) continue;
       auto& start = typed_footnote_start[static_cast<size_t>(side)];
       start = std::min(start, key.box.y0);
+    }
+    // Notes set across the page's full width: a note line that runs on over
+    // the gutter (word spacing, not a gutter's gap) opens the next column's
+    // footnote area too.
+    for (size_t side = 0; side + 1 < typed_footnote_start.size(); ++side) {
+      const double start = typed_footnote_start[side];
+      if (start > page.height) continue;
+      std::vector<size_t> zone;
+      for (size_t k = 0; k < page.normalized_boxes.size(); ++k) {
+        const auto& b = page.normalized_boxes[k];
+        if (b.rotation == 0 && b.box.y0 >= start - 1.0 && b.box.y1 <= bottom &&
+            side_of(columns, b.box) != static_cast<int>(side) + 1)
+          zone.push_back(k);
+      }
+      for (const auto& row : page_rows(page, zone)) {
+        double reach = -1e18;
+        for (size_t k : row.boxes) {
+          if (page.normalized_boxes[k].box.x0 <= columns.gutters[side]) reach = std::max(reach, page.normalized_boxes[k].box.x1);
+        }
+        if (reach < columns.gutters[side] - body * 3) continue;
+        const double em = std::max(4.0, row.size > 0 ? row.size : body);
+        const bool runs_on = std::any_of(page.normalized_boxes.begin(), page.normalized_boxes.end(), [&](const auto& b) {
+          return b.rotation == 0 && rows_overlap(row.box, b.box) && side_of(columns, b.box) == static_cast<int>(side) + 1 &&
+                 b.box.x0 >= reach - 0.5 && b.box.x0 - reach <= 0.6 * em;
+        });
+        if (runs_on) {
+          auto& next = typed_footnote_start[side + 1];
+          next = std::min(next, row.box.y0);
+          break;
+        }
+      }
     }
   }
   auto is_caption_seed = [&](const NormalizedTextBox& candidate) {

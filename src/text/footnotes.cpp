@@ -124,12 +124,17 @@ std::vector<TextLine> footnote_lines_by_geometry(const PageDom& page) {
 void link_note_markers(DocumentDom& dom) {
   // Notes in document order. A page whose footnote area opens without a key
   // continues the last note of an earlier page.
+  // Provenance lines under the notes (a DOI, submission dates, a licence)
+  // never continue a note; they gather apart, and go.
   std::vector<Note> notes;
+  bool in_provenance = false;
   for (const auto& page : dom.pages) {
     for (const auto& line : page.footnote_lines) {
-      if (!line.note_key.empty() || notes.empty()) {
+      const bool provenance = line.note_key.empty() && is_provenance_line(line.text);
+      if (!line.note_key.empty() || notes.empty() || (provenance && !in_provenance)) {
         notes.push_back({page.index, line.note_key, {}});
       }
+      in_provenance = line.note_key.empty() ? (provenance || in_provenance) : false;
       append_note_text(notes.back().text, line.text);
     }
   }

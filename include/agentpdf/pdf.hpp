@@ -3,6 +3,7 @@
 #include "agentpdf/types.hpp"
 
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -50,6 +51,7 @@ void renumber_synthetic_line_y(std::vector<TextLine>& lines);
 // hyphen), the evidence for line-end hyphen decisions.
 struct Vocabulary {
   std::unordered_set<std::string> words;
+  std::unordered_map<std::string, int> counts;  // how often each is printed
 };
 Vocabulary build_vocabulary(const std::vector<PageDom>& pages);
 // "first-" ending a line and "second" opening the next: a hyphenated

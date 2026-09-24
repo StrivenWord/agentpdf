@@ -174,7 +174,10 @@ Vocabulary build_vocabulary(const std::vector<PageDom>& pages) {
         continue;
       for (const auto& word : split_words(text)) {
         const auto key = word_key(word);
-        if (key.size() >= 2) vocab.words.insert(key);
+        if (key.size() >= 2) {
+          vocab.words.insert(key);
+          ++vocab.counts[key];
+        }
       }
     }
   }
@@ -414,6 +417,32 @@ std::vector<TextLine> region_lines(const std::vector<VisualLine>& visual,
     b.text = space == std::string::npos ? std::string() : trim(b.text.substr(space + 1));
     b.runin_len = b.runin_len > word.size() + 1 ? b.runin_len - (word.size() + 1) : 0;
   }
+  // A URL broken inside a word at the line end ("…/peaclab/Ca" +
+  // "rbonMeter."): the next line's first word completes it when the two
+  // halves make a word the document prints and the second is none.
+  for (size_t i = 0; i + 1 < out.size(); ++i) {
+    auto& a = out[i];
+    const auto last_space = a.text.rfind(' ');
+    const std::string token = a.text.substr(last_space == std::string::npos ? 0 : last_space + 1);
+    if (token.find("://") == std::string::npos && token.rfind("www.", 0) != 0) continue;
+    if (token.empty() || !std::isalnum(static_cast<unsigned char>(token.back()))) continue;
+    size_t j = i + 1;
+    while (j < out.size() && out[j].caption != a.caption) ++j;
+    if (j == out.size() || !out[j].note_key.empty() || out[j].text.empty()) continue;
+    auto& b = out[j];
+    const auto space = b.text.find(' ');
+    const std::string word = b.text.substr(0, space);
+    size_t cut = token.size();
+    while (cut > 0 && std::isalpha(static_cast<unsigned char>(token[cut - 1]))) --cut;
+    const std::string fragment = token.substr(cut);
+    const auto rest = vocab.counts.find(word_key(word));
+    const auto whole = vocab.counts.find(word_key(fragment + word));
+    if (fragment.empty() || whole == vocab.counts.end() || whole->second < 2 ||
+        (rest != vocab.counts.end() && rest->second > 1))
+      continue;
+    a.text += word;
+    b.text = space == std::string::npos ? std::string() : trim(b.text.substr(space + 1));
+  }
   out.erase(std::remove_if(out.begin(), out.end(),
                            [](const TextLine& line) { return line.text.empty(); }),
             out.end());
@@ -489,9 +518,122 @@ std::vector<VisualLine> column_reading_order(std::vector<VisualLine> visual,
       }
     }
   };
-  for (const auto& s : spanning) {
-    emit_band(s.box.y0);
-    out.push_back(std::move(visual[s.index]));
+  // Page text extent: a run of spanning lines that leaves room beside it
+  // (an abstract set right of an article-info column, a caption beside a
+  // column of text) reads as one block, with what stands beside it read
+  // apart: to its left before it, to its right after it.
+  double page_x0 = 1e18, page_x1 = -1e18;
+  for (const auto& p : placed) {
+    page_x0 = std::min(page_x0, p.box.x0);
+    page_x1 = std::max(page_x1, p.box.x1);
+  }
+  for (size_t i = 0; i < spanning.size();) {
+    // The block: spanning lines set closely one under another at one left
+    // edge, with the short lines of its paragraphs that end before the
+    // gutter ("institutions.").
+    size_t j = i + 1;
+    BBox block = spanning[i].box;
+    BBox last = block;
+    std::vector<size_t> absorbed;
+    for (;;) {
+      const double lead = std::max(4.0, last.height());
+      auto continues = [&](const BBox& next) {
+        return next.y0 > last.y0 + 0.5 * lead && next.y0 - last.y1 <= lead &&
+               std::abs(next.x0 - block.x0) <= lead * 1.5;
+      };
+      long column_line = -1;
+      for (size_t c = 0; c < columns.size(); ++c) {
+        const auto& b = columns[c].box;
+        if (used[c] || !continues(b) || b.x1 > block.x1 + 2.0) continue;
+        if (std::find(absorbed.begin(), absorbed.end(), c) != absorbed.end()) continue;
+        if (column_line < 0 || b.y0 < columns[static_cast<size_t>(column_line)].box.y0) column_line = static_cast<long>(c);
+      }
+      const bool spanning_next = j < spanning.size() && continues(spanning[j].box);
+      if (spanning_next &&
+          (column_line < 0 || spanning[j].box.y0 <= columns[static_cast<size_t>(column_line)].box.y0)) {
+        last = spanning[j].box;
+        ++j;
+      } else if (column_line >= 0) {
+        last = columns[static_cast<size_t>(column_line)].box;
+        absorbed.push_back(static_cast<size_t>(column_line));
+      } else {
+        break;
+      }
+      block.x0 = std::min(block.x0, last.x0);
+      block.x1 = std::max(block.x1, last.x1);
+      block.y1 = std::max(block.y1, last.y1);
+    }
+    const double em = std::max(4.0, spanning[i].box.height());
+    const bool room = j - i >= 2 && (block.x0 > page_x0 + 3 * em || block.x1 < page_x1 - 3 * em);
+    if (!room) {
+      for (size_t k = i; k < j; ++k) {
+        emit_band(spanning[k].box.y0);
+        out.push_back(std::move(visual[spanning[k].index]));
+      }
+      i = j;
+      continue;
+    }
+    // A label set over the block at its left edge ("ABSTRACT") heads it.
+    long label = -1;
+    for (size_t c = 0; c < columns.size(); ++c) {
+      const auto& b = columns[c].box;
+      if (used[c] || std::abs(b.x0 - block.x0) > 2.0 || b.y1 > block.y0 + 1.0 || block.y0 - b.y1 > 2.5 * em) continue;
+      if (label < 0 || b.y0 > columns[static_cast<size_t>(label)].box.y0) label = static_cast<long>(c);
+    }
+    const double top = label >= 0 ? columns[static_cast<size_t>(label)].box.y0 : block.y0;
+    auto beside = [&](size_t c, bool to_left) {
+      const auto& b = columns[c].box;
+      if (used[c] || static_cast<long>(c) == label || b.cy() < top || b.y0 > block.y1) return false;
+      return to_left ? b.x1 < block.x0 - 2.0 : b.x0 > block.x1 + 2.0;
+    };
+    bool any_beside = false;
+    for (size_t c = 0; c < columns.size() && !any_beside; ++c) any_beside = beside(c, true) || beside(c, false);
+    if (!any_beside) {
+      for (size_t k = i; k < j; ++k) {
+        emit_band(spanning[k].box.y0);
+        out.push_back(std::move(visual[spanning[k].index]));
+      }
+      i = j;
+      continue;
+    }
+    emit_band(top);
+    std::vector<size_t> left, right;
+    for (size_t c = 0; c < columns.size(); ++c) {
+      if (beside(c, true)) left.push_back(c);
+      else if (beside(c, false)) right.push_back(c);
+    }
+    auto emit_side = [&](std::vector<size_t>& side) {
+      std::sort(side.begin(), side.end(), [&](size_t a, size_t b) { return by_y(columns[a], columns[b]); });
+      for (size_t c : side) {
+        used[c] = true;
+        out.push_back(std::move(visual[columns[c].index]));
+      }
+    };
+    // A block that opens the page runs on from the page before: it is read
+    // first, then what stands beside it.
+    const bool opens_page = std::none_of(out.begin(), out.end(), [&](const VisualLine& line) {
+      return std::any_of(line.boxes.begin(), line.boxes.end(),
+                         [&](size_t k) { return boxes[k].region == RegionKind::Body; });
+    });
+    if (!opens_page) emit_side(left);
+    if (label >= 0) {
+      used[static_cast<size_t>(label)] = true;
+      out.push_back(std::move(visual[columns[static_cast<size_t>(label)].index]));
+    }
+    {
+      std::vector<const Placed*> members;
+      for (size_t k = i; k < j; ++k) members.push_back(&spanning[k]);
+      for (size_t c : absorbed) {
+        if (used[c]) continue;
+        used[c] = true;
+        members.push_back(&columns[c]);
+      }
+      std::sort(members.begin(), members.end(), [&](const Placed* a, const Placed* b) { return by_y(*a, *b); });
+      for (const Placed* m : members) out.push_back(std::move(visual[m->index]));
+    }
+    if (opens_page) emit_side(left);
+    emit_side(right);
+    i = j;
   }
   emit_band(1e18);
   return out;
@@ -693,6 +835,20 @@ void mark_paragraph_starts(std::vector<TextLine>& lines) {
       continue;
     }
     const auto& prev = lines[static_cast<size_t>(p)];
+    // Read after a box set beside the text (keywords beside an abstract):
+    // the text above in the line's own column decides.
+    if (prev.has_geom && line.block_start && !same_column(prev.geom, line.geom)) {
+      for (size_t j = static_cast<size_t>(p); j-- > 0;) {
+        const auto& above = lines[j];
+        if (above.caption || !above.has_geom || !same_column(above.geom, line.geom) ||
+            above.geom.y1 > line.geom.y0)
+          continue;
+        if (ends_paragraph_like(above.text) && line.geom.y0 - above.geom.y1 > 0.9 * em_of(line))
+          line.para_start = true;
+        break;
+      }
+      if (line.para_start) continue;
+    }
     if (!prev.has_geom || !ends_paragraph_like(prev.text)) continue;
     const size_t pi = static_cast<size_t>(p);
     const bool column = same_column(prev.geom, line.geom) && prev.geom.y0 < line.geom.y0;
