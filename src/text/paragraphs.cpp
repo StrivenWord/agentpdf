@@ -1603,17 +1603,21 @@ void build_blocks_from_lines(DocumentDom& dom, const Heuristics& heuristics) {
     }
     page.blocks.swap(merged);
   }
-  for (size_t p = 1; p < dom.pages.size(); ++p) {
-    auto& prev = dom.pages[p - 1];
-    auto& cur = dom.pages[p];
-    if (prev.blocks.empty() || cur.blocks.empty()) continue;
-    auto& a = prev.blocks.back();
-    auto& b = cur.blocks.front();
-    if (a.kind != BlockKind::Paragraph || b.kind != BlockKind::Paragraph) continue;
-    if (b.entry_start || b.para_start) continue;
-    if (ends_sentence_like(a.text) && !b.continues) continue;
-    append_paragraph(a, b);
-    cur.blocks.erase(cur.blocks.begin());
+  // Across page turns: the text's last block so far, on whichever page (a
+  // page whose one paragraph ran on from the page before has none left).
+  Block* last = nullptr;
+  for (auto& cur : dom.pages) {
+    if (cur.blocks.empty()) continue;
+    if (last) {
+      auto& b = cur.blocks.front();
+      const bool join = last->kind == BlockKind::Paragraph && b.kind == BlockKind::Paragraph && !b.entry_start &&
+                        !b.para_start && !(ends_sentence_like(last->text) && !b.continues);
+      if (join) {
+        append_paragraph(*last, b);
+        cur.blocks.erase(cur.blocks.begin());
+      }
+    }
+    if (!cur.blocks.empty()) last = &cur.blocks.back();
   }
 
   bool inside_acm_diagram = false;

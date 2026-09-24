@@ -953,6 +953,22 @@ void mark_paragraph_starts(std::vector<TextLine>& lines, const std::vector<doubl
     }
     return mates >= 6 && inset * 5 >= mates * 2 && inset * 5 <= mates * 4;
   };
+  // The page's usual line pitch: baseline to baseline down a column.
+  double usual_pitch = 0;
+  {
+    std::vector<double> pitches;
+    for (size_t i = 1; i < lines.size(); ++i) {
+      const auto& a = lines[i - 1];
+      const auto& b = lines[i];
+      if (!a.has_geom || !b.has_geom || a.caption || b.caption || !same_column(a.geom, b.geom)) continue;
+      const double pitch = b.geom.y0 - a.geom.y0;
+      if (pitch > 0 && pitch < 3.0 * em_of(b)) pitches.push_back(pitch);
+    }
+    if (pitches.size() >= 5) {
+      std::sort(pitches.begin(), pitches.end());
+      usual_pitch = pitches[pitches.size() / 2];
+    }
+  }
   // Captions are set apart from the text: its lines are read past them.
   auto previous_text_line = [&](size_t i) -> long {
     for (size_t j = i; j-- > 0;) {
@@ -1012,7 +1028,14 @@ void mark_paragraph_starts(std::vector<TextLine>& lines, const std::vector<doubl
       line.para_start = true;
       continue;
     }
-    if (column && line.block_start && line.geom.y0 - prev.geom.y1 > 0.9 * em_of(line))
+    if (column && line.block_start && line.geom.y0 - prev.geom.y1 > 0.9 * em_of(line)) {
+      line.para_start = true;
+      continue;
+    }
+    // A blank line's worth of space between lines of a column (ragged text
+    // whose paragraphs are set apart only by space).
+    if (column && usual_pitch > 0 && line.geom.y0 - prev.geom.y0 > 1.6 * usual_pitch &&
+        line.geom.y0 - prev.geom.y0 < 4.0 * usual_pitch)
       line.para_start = true;
   }
 }
